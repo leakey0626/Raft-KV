@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module org.jetbrains.idea.maven.project.MavenProjectsManager.isMavenModule="true" type="JAVA_MODULE" version="4">
-  <component name="NewModuleRootManager" LANGUAGE_LEVEL="JDK_1_5">
+  <component name="NewModuleRootManager" LANGUAGE_LEVEL="JDK_1_8">
     <output url="file://$MODULE_DIR$/target/classes" />
     <output-test url="file://$MODULE_DIR$/target/test-classes" />
     <content url="file://$MODULE_DIR$">
@@ -12,10 +12,12 @@
     <orderEntry type="jdk" jdkName="corretto-1.8" jdkType="JavaSDK" />
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="library" name="Maven: org.projectlombok:lombok:1.18.20" level="project" />
+    <orderEntry type="library" name="Maven: org.slf4j:slf4j-api:2.0.0-alpha1" level="project" />
     <orderEntry type="library" name="Maven: com.alipay.sofa:bolt:1.6.4" level="project" />
     <orderEntry type="library" name="Maven: io.netty:netty-all:4.1.42.Final" level="project" />
     <orderEntry type="library" name="Maven: com.alipay.sofa.common:sofa-common-tools:1.0.12" level="project" />
     <orderEntry type="library" name="Maven: com.alibaba:fastjson:1.2.49" level="project" />
     <orderEntry type="library" name="Maven: com.alipay.sofa:hessian:3.3.6" level="project" />
+    <orderEntry type="library" name="Maven: org.rocksdb:rocksdbjni:5.14.3" level="project" />
   </component>
 </module>

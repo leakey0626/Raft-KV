@@ -11,7 +11,7 @@
       </profile>
     </annotationProcessing>
     <bytecodeTargetLevel>
-      <module name="raft-kv" target="1.5" />
+      <module name="raft-kv" target="8" />
       <module name="Raft-KV" target="1.5" />
     </bytecodeTargetLevel>
   </component>
