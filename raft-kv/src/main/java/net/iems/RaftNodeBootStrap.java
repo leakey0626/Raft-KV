@@ -1,7 +1,8 @@
 package net.iems;
 
 import lombok.extern.slf4j.Slf4j;
-import net.iems.config.RaftConfig;
+import net.iems.service.RaftNode;
+import net.iems.service.config.RaftConfig;
 
 import java.util.Collections;
 import java.util.List;

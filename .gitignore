@@ -12,6 +12,9 @@
 
 rocksDB-raft/
 
+raft-kv/target/
+
+
 # Package Files #
 *.jar
 *.war
