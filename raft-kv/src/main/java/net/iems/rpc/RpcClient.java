@@ -2,8 +2,8 @@ package net.iems.rpc;
 
 import com.alipay.remoting.exception.RemotingException;
 import lombok.extern.slf4j.Slf4j;
-import net.iems.request.Request;
-import net.iems.request.Response;
+import net.iems.proto.Request;
+import net.iems.proto.Response;
 
 import java.util.concurrent.TimeUnit;
 
@@ -14,7 +14,12 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 public class RpcClient {
 
-    private final static com.alipay.remoting.rpc.RpcClient CLIENT = new com.alipay.remoting.rpc.RpcClient();
+    private com.alipay.remoting.rpc.RpcClient CLIENT;
+
+    public RpcClient(){
+        CLIENT = new com.alipay.remoting.rpc.RpcClient();
+        CLIENT.startup();
+    }
 
     public <R> R send(Request request) {
         return send(request, (int) TimeUnit.SECONDS.toMillis(5));

@@ -1,8 +1,10 @@
-package net.iems.request;
+package net.iems.proto;
 
 import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
+
+import java.io.Serializable;
 
 /**
  *
@@ -11,7 +13,7 @@ import lombok.ToString;
 @Setter
 @Getter
 @ToString
-public class AppendResult {
+public class AppendResponse implements Serializable {
 
     /** 被请求方的任期号，用于领导人去更新自己 */
     long term;
@@ -19,30 +21,30 @@ public class AppendResult {
     /** 跟随者包含了匹配上 prevLogIndex 和 prevLogTerm 的日志时为真  */
     boolean success;
 
-    public AppendResult(long term) {
+    public AppendResponse(long term) {
         this.term = term;
     }
 
-    public AppendResult(boolean success) {
+    public AppendResponse(boolean success) {
         this.success = success;
     }
 
-    public AppendResult(long term, boolean success) {
+    public AppendResponse(long term, boolean success) {
         this.term = term;
         this.success = success;
     }
 
-    private AppendResult(Builder builder) {
+    private AppendResponse(Builder builder) {
         setTerm(builder.term);
         setSuccess(builder.success);
     }
 
-    public static AppendResult fail() {
-        return new AppendResult(false);
+    public static AppendResponse fail() {
+        return new AppendResponse(false);
     }
 
-    public static AppendResult ok() {
-        return new AppendResult(true);
+    public static AppendResponse ok() {
+        return new AppendResponse(true);
     }
 
     public static Builder newBuilder() {
@@ -68,8 +70,8 @@ public class AppendResult {
             return this;
         }
 
-        public AppendResult build() {
-            return new AppendResult(this);
+        public AppendResponse build() {
+            return new AppendResponse(this);
         }
     }
 

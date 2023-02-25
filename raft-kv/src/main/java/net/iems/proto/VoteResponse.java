@@ -1,4 +1,4 @@
-package net.iems.request;
+package net.iems.proto;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -11,7 +11,7 @@ import java.io.Serializable;
  */
 @Getter
 @Setter
-public class VoteResult implements Serializable {
+public class VoteResponse implements Serializable {
 
     /**
      * 当前任期号，以便于候选人去更新自己的任期
@@ -23,21 +23,21 @@ public class VoteResult implements Serializable {
      */
     boolean voteGranted;
 
-    public VoteResult(boolean voteGranted) {
+    public VoteResponse(boolean voteGranted) {
         this.voteGranted = voteGranted;
     }
 
-    private VoteResult(Builder builder) {
+    private VoteResponse(Builder builder) {
         setTerm(builder.term);
         setVoteGranted(builder.voteGranted);
     }
 
-    public static VoteResult fail() {
-        return new VoteResult(false);
+    public static VoteResponse fail() {
+        return new VoteResponse(false);
     }
 
-    public static VoteResult ok() {
-        return new VoteResult(true);
+    public static VoteResponse ok() {
+        return new VoteResponse(true);
     }
 
     public static Builder newBuilder() {
@@ -63,8 +63,8 @@ public class VoteResult implements Serializable {
             return this;
         }
 
-        public VoteResult build() {
-            return new VoteResult(this);
+        public VoteResponse build() {
+            return new VoteResponse(this);
         }
     }
 }

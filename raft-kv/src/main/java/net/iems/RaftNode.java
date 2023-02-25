@@ -1,16 +1,15 @@
 package net.iems;
 
+import io.netty.util.internal.StringUtil;
 import lombok.extern.slf4j.Slf4j;
 import net.iems.config.RaftConfig;
 import net.iems.constant.NodeStatus;
 import net.iems.db.StateMachine;
 import net.iems.log.LogEntry;
 import net.iems.log.LogModule;
-import net.iems.request.*;
+import net.iems.proto.*;
 import net.iems.rpc.RpcClient;
-import net.iems.rpc.RpcService;
-import net.iems.service.RaftService;
-import net.iems.service.impl.RaftServiceImpl;
+import net.iems.rpc.RpcServer;
 
 import java.util.ArrayList;
 import java.util.LinkedList;
@@ -18,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static net.iems.constant.NodeStatus.LEADER;
@@ -34,16 +34,20 @@ public class RaftNode {
 
     private int electionTimeout;
 
-    private RaftService service;
-
     private volatile NodeStatus status;
 
     private volatile long term;
 
     private volatile String votedFor;
 
+    /** 领导者地址 */
+    private volatile String leader;
+
     /** 上次选举时间 */
     private long preElectionTime;
+
+    /** 上次心跳时间 */
+    private long preHeartBeatTime;
 
     /** 集群其它节点地址，格式："ip:port" */
     private List<String> peerAddrs;
@@ -65,18 +69,25 @@ public class RaftNode {
     private ThreadPoolExecutor te;
 
     /** RPC 客户端 */
-    private final RpcClient rpcClient;
+    private RpcClient rpcClient;
 
     /** RPC 服务端 */
-    private RpcService rpcServer;
+    private RpcServer rpcServer;
+
+    /** 一致性信号 */
+    public final Integer consistencySignal = 1;
+
+    /** 处理选举请求的锁 */
+    public final ReentrantLock voteLock = new ReentrantLock();
+
+    /** 处理日志请求的锁 */
+    public final ReentrantLock appendLock = new ReentrantLock();
 
     public RaftNode(){
         setConfig();
-        threadPoolInit();
-        service = new RaftServiceImpl();
-        rpcClient = new RpcClient();
         logModule = LogModule.getInstance();
         stateMachine = StateMachine.getInstance();
+        threadPoolInit();
     }
 
     /**
@@ -85,11 +96,15 @@ public class RaftNode {
     private void setConfig(){
         heartBeatInterval = RaftConfig.heartBeatInterval;
         electionTimeout = RaftConfig.electionTimeout;
+        preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
+        preHeartBeatTime = System.currentTimeMillis();
         status = FOLLOWER;
-        // TODO 设置 peerAddr
         String port = System.getProperty("server.port");
-        myAddr = "localhost" + ":" + Integer.parseInt(port);
-        rpcServer = new RpcService(Integer.parseInt(port), this);
+        myAddr = "localhost:" + port;
+        rpcServer = new RpcServer(Integer.parseInt(port), this);
+        rpcClient = new RpcClient();
+        peerAddrs = RaftConfig.getList();
+        peerAddrs.remove(myAddr);
     }
 
     /**
@@ -97,41 +112,164 @@ public class RaftNode {
      */
     private void threadPoolInit(){
 
-        /** 线程池参数 */
+        // 线程池参数
         int cup = Runtime.getRuntime().availableProcessors();
         int maxPoolSize = cup * 2;
         final int queueSize = 1024;
         final long keepTime = 1000 * 60;
-        TimeUnit keepTimeUnit = TimeUnit.MILLISECONDS;
 
         ss = new ScheduledThreadPoolExecutor(cup);
         te = new ThreadPoolExecutor(
                 cup,
                 maxPoolSize,
                 keepTime,
-                keepTimeUnit,
+                TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<Runnable>(queueSize));
+
+        ss.scheduleWithFixedDelay(new HeartBeatTask(), 0, heartBeatInterval, TimeUnit.MILLISECONDS);
+        ss.scheduleAtFixedRate(new ElectionTask(), 3000, 100, TimeUnit.MILLISECONDS);
     }
 
     /**
      * 处理客户端请求
      */
-    public void propose(){
-
+    public ClientResponse propose(ClientRequest param){
+        return null;
     }
 
     /**
      * 处理来自其它节点的非选举请求（心跳或追加日志）
      */
-    public void appendEntries(){
+    public AppendResponse appendEntries(AppendRequest param){
+        AppendResponse result = AppendResponse.fail();
+        try {
+            appendLock.lock();
+            result.setTerm(term);
 
+            // 请求方任期较低，直接拒绝
+            if (param.getTerm() < term) {
+                return result;
+            }
+
+            preHeartBeatTime = System.currentTimeMillis();
+            preElectionTime = System.currentTimeMillis();
+            leader = param.getLeaderId();
+
+            // 够格
+            if (status != FOLLOWER) {
+                log.info("node {} become FOLLOWER, term : {}, param Term : {}",
+                        myAddr, term, param.getTerm());
+                // 收到了新领导者的append entry请求，转为跟随者
+                status = NodeStatus.FOLLOWER;
+            }
+            // 更新term
+            term = param.getTerm();
+
+            //心跳
+            if (param.getEntries() == null || param.getEntries().length == 0) {
+                log.info("receive heartbeat from node {}, term : {}",
+                        param.getLeaderId(), param.getTerm());
+                // 旧日志提交
+                long nextCommit = getCommitIndex() + 1;
+                while (nextCommit <= param.getLeaderCommit()
+                        && logModule.read(nextCommit) != null){
+                    stateMachine.apply(logModule.read(nextCommit));
+                    nextCommit++;
+                }
+                setCommitIndex(nextCommit - 1);
+                return AppendResponse.newBuilder().term(term).success(true).build();
+            }
+
+            // 1. preLog匹配判断
+            if (logModule.getLastIndex() != param.getPrevLogIndex()){
+                // index不匹配
+                return result;
+            } else if (param.getPrevLogIndex() >= 0) {
+                // index匹配且前一个日志存在，比较任期号
+                LogEntry preEntry = logModule.read(param.getPrevLogIndex());
+                if (preEntry.getTerm() != param.getPreLogTerm()) {
+                    // 任期号不匹配
+                    return result;
+                }
+            } // else ... 前一个日志不存在时，无需查看任期号
+
+            // 2. 清理多余的旧日志
+            long curIdx = param.getPrevLogIndex() + 1;
+            if (logModule.read(curIdx) != null){
+                logModule.removeOnStartIndex(curIdx);
+            }
+
+            // 3. 追加日志到本地文件
+            LogEntry[] entries = param.getEntries();
+            for (LogEntry logEntry : entries) {
+                logModule.write(logEntry);
+            }
+
+            // 4. 旧日志提交
+            long nextCommit = getCommitIndex() + 1;
+            while (nextCommit <= param.getLeaderCommit()){
+                stateMachine.apply(logModule.read(nextCommit));
+                nextCommit++;
+            }
+            setCommitIndex(nextCommit - 1);
+
+            // 5. 同意append entry请求
+            result.setSuccess(true);
+            return result;
+
+        } finally {
+            appendLock.unlock();
+        }
     }
-
+    
     /**
      * 处理来自其它节点的投票请求
      */
-    public void requestVote(){
+    public VoteResponse requestVote(VoteRequest param) {
+        log.info("vote process for {}, its term {} ", param.getCandidateAddr(), param.getTerm());
+        try {
+            VoteResponse.Builder builder = VoteResponse.newBuilder();
+            voteLock.lock();
 
+            // 对方任期没有自己新
+            if (param.getTerm() < term) {
+                // 返回投票结果的同时更新对方的term
+                log.info("node {} decline to vote for candidate {} because of smaller term", myAddr, param.getCandidateAddr());
+                return builder.term(term).voteGranted(false).build();
+            }
+
+            if ((StringUtil.isNullOrEmpty(votedFor) || votedFor.equals(param.getCandidateAddr()))) {
+                if (logModule.getLast() != null) {
+                    // 对方没有自己新
+                    if (logModule.getLast().getTerm() > param.getLastLogTerm()) {
+                        log.info("node {} decline to vote for candidate {} because of older log term", myAddr, param.getCandidateAddr());
+                        return VoteResponse.fail();
+                    }
+                    // 对方没有自己新
+                    if (logModule.getLastIndex() > param.getLastLogIndex()) {
+                        log.info("node {} decline to vote for candidate {} because of older logs", myAddr, param.getCandidateAddr());
+                        return VoteResponse.fail();
+                    }
+                }
+
+                // 切换状态
+                status = NodeStatus.FOLLOWER;
+                // 更新
+                leader = param.getCandidateAddr();
+                term = param.getTerm();
+                votedFor = param.getCandidateAddr();
+                preElectionTime = System.currentTimeMillis();
+                log.info("node {} vote for candidate: {}", myAddr, param.getCandidateAddr());
+                // 返回成功
+                return builder.term(term).voteGranted(true).build();
+            }
+
+            log.info("node {} decline to vote for candidate {} because there is no vote available", myAddr, param.getCandidateAddr());
+            return builder.term(term).voteGranted(false).build();
+
+        } finally {
+            voteLock.unlock();
+        }
     }
 
     /**
@@ -140,12 +278,13 @@ public class RaftNode {
     public void redirect(){
 
     }
-
+    
     /**
      * 发起选举
      */
     class ElectionTask implements Runnable{
 
+        @Override
         public void run() {
 
             // leader状态下不允许发起选举
@@ -161,12 +300,13 @@ public class RaftNode {
             }
 
             status = CANDIDATE;
+            // leader = "";
             term++;
             votedFor = myAddr;
             log.info("node {} become CANDIDATE and start election, its term : [{}], LastEntry : [{}]",
                     myAddr, term, logModule.getLast());
 
-            ArrayList<Future<VoteResult>> futureArrayList = new ArrayList<>();
+            ArrayList<Future<VoteResponse>> futureArrayList = new ArrayList<>();
 
             // 发送投票请求
             for (String peer : peerAddrs) {
@@ -212,10 +352,10 @@ public class RaftNode {
             CountDownLatch latch = new CountDownLatch(futureArrayList.size());
 
             // 利用多线程获取结果
-            for (Future<VoteResult> future : futureArrayList) {
+            for (Future<VoteResponse> future : futureArrayList) {
                 te.submit(() -> {
                     try {
-                        VoteResult result = future.get(1000, MILLISECONDS);
+                        VoteResponse result = future.get(1000, MILLISECONDS);
                         if (result == null) {
                             // rpc调用失败或任务超时
                             return -1;
@@ -357,6 +497,90 @@ public class RaftNode {
         return stateMachine.getCommit();
     }
 
+
+    /**
+     * 发送心跳信号，通过线程池执行
+     * 如果收到了来自任期更大的节点的响应，则转为跟随者
+     * RPC请求类型为A_ENTRIES
+     */
+    class HeartBeatTask implements Runnable {
+
+        @Override
+        public void run() {
+
+            if (status != LEADER) {
+                return;
+            }
+
+            long current = System.currentTimeMillis();
+            if (current - preHeartBeatTime < heartBeatInterval) {
+                return;
+            }
+
+            preHeartBeatTime = System.currentTimeMillis();
+            AppendRequest param = AppendRequest.builder()
+                    .entries(null)// 心跳,空日志.
+                    .leaderId(myAddr)
+                    .term(term)
+                    .leaderCommit(getCommitIndex())
+                    .build();
+            List<Future<Boolean>> futureList = new ArrayList<>();
+
+            for (String peer : peerAddrs) {
+                Request request = new Request(
+                        Request.A_ENTRIES,
+                        param,
+                        peer);
+
+                // 并行发起 RPC 复制并获取响应
+                futureList.add(te.submit(() -> {
+                    try {
+                        AppendResponse aentryResult = rpcClient.send(request);
+                        long resultTermterm = aentryResult.getTerm();
+
+                        if (resultTermterm > term) {
+                            log.warn("follow new leader {}", peer);
+                            term = resultTermterm;
+                            votedFor = "";
+                            status = NodeStatus.FOLLOWER;
+                        }
+                        return aentryResult.isSuccess();
+                    } catch (Exception e) {
+                        log.error("HeartBeatTask RPC Fail, request URL : {} ", request.getUrl());
+                        return false;
+                    }
+                }));
+            }
+            int count = futureList.size();
+            int success = 0;
+
+            CountDownLatch latch = new CountDownLatch(futureList.size());
+            List<Boolean> resultList = new CopyOnWriteArrayList<>();
+
+            replicationResult(futureList, latch, resultList);
+
+            try {
+                // 等待 replicationResult 中的线程执行完毕
+                latch.await(3000, MILLISECONDS);
+            } catch (InterruptedException e) {
+                log.error(e.getMessage(), e);
+            }
+
+            for (Boolean aBoolean : resultList) {
+                if (aBoolean) {
+                    success++;
+                }
+            }
+
+            //  心跳响应成功，通知阻塞的线程
+            if (success * 2 >= count) {
+                synchronized (consistencySignal){
+                    consistencySignal.notify();
+                }
+            }
+        }
+    }
+
     /**
      * 等待 future 对应的线程执行完毕，将结果写入 resultList
      * @param futureList
@@ -402,30 +626,27 @@ public class RaftNode {
 
                 Long nextIndex = nextIndexs.get(peer);
 
-                // 心跳请求跳过步骤 2~3
-                if (entry != null){
-                    // 2. 生成日志数组
-                    nextIndex = nextIndexs.get(peer);
-                    LinkedList<LogEntry> logEntries = new LinkedList<>();
-                    if (entry.getIndex() >= nextIndex) {
-                        // 把 nextIndex ~ entry.index 之间的日志都加入list
-                        for (long i = nextIndex; i <= entry.getIndex(); i++) {
-                            LogEntry l = logModule.read(i);
-                            if (l != null) {
-                                logEntries.add(l);
-                            }
+                // 2. 生成日志数组
+                nextIndex = nextIndexs.get(peer);
+                LinkedList<LogEntry> logEntries = new LinkedList<>();
+                if (entry.getIndex() >= nextIndex) {
+                    // 把 nextIndex ~ entry.index 之间的日志都加入list
+                    for (long i = nextIndex; i <= entry.getIndex(); i++) {
+                        LogEntry l = logModule.read(i);
+                        if (l != null) {
+                            logEntries.add(l);
                         }
-                    } else {
-                        logEntries.add(entry);
                     }
-                    appendRequest.setEntries(logEntries.toArray(new LogEntry[0]));
-
-                    // 3. 设置preLog相关参数，用于日志匹配
-                    LogEntry preLog = getPreLog(logEntries.getFirst());
-                    // preLog不存在时，下述参数会被设为-1
-                    appendRequest.setPreLogTerm(preLog.getTerm());
-                    appendRequest.setPrevLogIndex(preLog.getIndex());
+                } else {
+                    logEntries.add(entry);
                 }
+                appendRequest.setEntries(logEntries.toArray(new LogEntry[0]));
+
+                // 3. 设置preLog相关参数，用于日志匹配
+                LogEntry preLog = getPreLog(logEntries.getFirst());
+                // preLog不存在时，下述参数会被设为-1
+                appendRequest.setPreLogTerm(preLog.getTerm());
+                appendRequest.setPrevLogIndex(preLog.getIndex());
 
                 // 4. 封装RPC请求
                 Request request = Request.builder()
@@ -436,7 +657,7 @@ public class RaftNode {
 
                 try {
                     // 5. 发送RPC请求；同步调用，阻塞直到获取返回值
-                    AppendResult result = rpcClient.send(request);
+                    AppendResponse result = rpcClient.send(request);
                     if (result == null) {
                         // timeout
                         return false;
@@ -466,7 +687,7 @@ public class RaftNode {
                     end = System.currentTimeMillis();
 
                 } catch (Exception e) {
-                    log.warn(e.getMessage(), e);
+                    log.error("Append Entry RPC Fail, request URL : {} ", request.getUrl());
                     return false;
                 }
             }

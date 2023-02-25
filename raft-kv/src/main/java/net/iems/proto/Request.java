@@ -1,7 +1,9 @@
-package net.iems.request;
+package net.iems.proto;
 
 import lombok.Builder;
 import lombok.Data;
+
+import java.io.Serializable;
 
 /**
  * RPC调用请求体
@@ -9,7 +11,7 @@ import lombok.Data;
  */
 @Builder
 @Data
-public class Request {
+public class Request implements Serializable {
 
     /** 请求投票 */
     public static final int R_VOTE = 0;

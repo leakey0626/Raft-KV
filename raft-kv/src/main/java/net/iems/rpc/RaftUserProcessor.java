@@ -3,19 +3,19 @@ package net.iems.rpc;
 import com.alipay.remoting.AsyncContext;
 import com.alipay.remoting.BizContext;
 import com.alipay.remoting.rpc.protocol.AbstractUserProcessor;
-import net.iems.request.Request;
+import com.alipay.remoting.rpc.protocol.SyncUserProcessor;
+import net.iems.proto.Request;
 
-public abstract class RaftUserProcessor<T> extends AbstractUserProcessor<T> {
+public class RaftUserProcessor<T> extends SyncUserProcessor<T> {
+
 
     @Override
-    public void handleRequest(BizContext bizCtx, AsyncContext asyncCtx, T request) {
-        throw new RuntimeException(
-            "Raft Server not support handleRequest(BizContext bizCtx, AsyncContext asyncCtx, T request) ");
+    public Object handleRequest(BizContext bizContext, T t) throws Exception {
+        return null;
     }
-
 
     @Override
     public String interest() {
-        return Request.class.getName();
+        return null;
     }
 }

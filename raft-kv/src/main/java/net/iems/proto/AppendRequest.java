@@ -1,10 +1,12 @@
-package net.iems.request;
+package net.iems.proto;
 
 import lombok.Builder;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
 import net.iems.log.LogEntry;
+
+import java.io.Serializable;
 
 /**
  * Created by 大东 on 2023/2/24.
@@ -13,7 +15,7 @@ import net.iems.log.LogEntry;
 @Setter
 @ToString
 @Builder
-public class AppendRequest {
+public class AppendRequest implements Serializable {
 
     /** 候选人的任期号  */
     private long term;
@@ -35,4 +37,5 @@ public class AppendRequest {
 
     /** 领导人已经提交的日志的索引值  */
     private long leaderCommit;
+
 }

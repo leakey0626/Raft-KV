@@ -1,4 +1,4 @@
-package net.iems.request;
+package net.iems.proto;
 
 import lombok.Builder;
 import lombok.Data;
