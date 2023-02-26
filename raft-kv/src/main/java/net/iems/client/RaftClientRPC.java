@@ -48,7 +48,7 @@ public class RaftClientRPC {
         while (response == null){
             // 不断重试，直到获取服务端响应
             try {
-                response = CLIENT.send(r);
+                response = CLIENT.send(r, 500);
             } catch (Exception e) {
                 r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
             }
@@ -71,7 +71,7 @@ public class RaftClientRPC {
         while (response == null || response.getResult().equals("fail")){
             // 不断重试，直到获取服务端响应
             try {
-                response = CLIENT.send(r);
+                response = CLIENT.send(r, 500);
             } catch (Exception e) {
                 r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
             }
@@ -91,7 +91,7 @@ public class RaftClientRPC {
         while (response == null || response.getResult().equals("fail")){
             // 不断重试，直到获取服务端响应
             try {
-                response = CLIENT.send(r);
+                response = CLIENT.send(r, 500);
             } catch (Exception e) {
                 r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
             }

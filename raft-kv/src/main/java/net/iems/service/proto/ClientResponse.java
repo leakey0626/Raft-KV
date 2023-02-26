@@ -33,6 +33,7 @@ public class ClientResponse implements Serializable {
         return new ClientResponse("fail");
     }
 
+
     public static Builder newBuilder() {
         return new Builder();
     }
