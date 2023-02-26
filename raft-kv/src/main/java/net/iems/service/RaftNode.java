@@ -15,7 +15,6 @@ import net.iems.service.rpc.RpcClient;
 import net.iems.service.rpc.RpcServer;
 
 import java.util.ArrayList;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -56,7 +55,7 @@ public class RaftNode {
     private List<String> peerAddrs;
 
     /** 对于每一个服务器，需要发送给他的下一个日志条目的索引值 */
-    Map<String, Long> nextIndexs;
+    Map<String, Long> nextIndexes;
 
     /** 当前节点地址 */
     private String myAddr;
@@ -87,10 +86,11 @@ public class RaftNode {
     public final ReentrantLock appendLock = new ReentrantLock();
 
     public RaftNode(){
-        setConfig();
         logModule = LogModule.getInstance();
         stateMachine = StateMachine.getInstance();
+        setConfig();
         threadPoolInit();
+        log.info("Raft node started successfully. The current term is {}", term);
     }
 
     /**
@@ -108,6 +108,10 @@ public class RaftNode {
         rpcClient = new RpcClient();
         peerAddrs = RaftConfig.getList();
         peerAddrs.remove(myAddr);
+        LogEntry last = logModule.getLast();
+        if (last != null){
+            term = last.getTerm();
+        }
     }
 
 
@@ -345,7 +349,7 @@ public class RaftNode {
      * 处理来自其它节点的投票请求
      */
     public VoteResult requestVote(VoteParam param) {
-        log.info("vote process for {}, its term {} ", param.getCandidateAddr(), param.getTerm());
+        //log.info("vote process for {}, its term {} ", param.getCandidateAddr(), param.getTerm());
         try {
             VoteResult.Builder builder = VoteResult.newBuilder();
             voteLock.lock();
@@ -353,7 +357,8 @@ public class RaftNode {
             // 对方任期没有自己新
             if (param.getTerm() < term) {
                 // 返回投票结果的同时更新对方的term
-                log.info("node {} decline to vote for candidate {} because of smaller term", myAddr, param.getCandidateAddr());
+                log.info("decline to vote for candidate {} because of smaller term", param.getCandidateAddr());
+                preElectionTime = System.currentTimeMillis();
                 return builder.term(term).voteGranted(false).build();
             }
 
@@ -361,12 +366,14 @@ public class RaftNode {
                 if (logModule.getLast() != null) {
                     // 对方没有自己新
                     if (logModule.getLast().getTerm() > param.getLastLogTerm()) {
-                        log.info("node {} decline to vote for candidate {} because of older log term", myAddr, param.getCandidateAddr());
+                        log.info("decline to vote for candidate {} because of older log term", param.getCandidateAddr());
+                        preElectionTime = System.currentTimeMillis();
                         return VoteResult.fail();
                     }
                     // 对方没有自己新
                     if (logModule.getLastIndex() > param.getLastLogIndex()) {
-                        log.info("node {} decline to vote for candidate {} because of older logs", myAddr, param.getCandidateAddr());
+                        log.info("node decline to vote for candidate {} because of older log index", param.getCandidateAddr());
+                        preElectionTime = System.currentTimeMillis();
                         return VoteResult.fail();
                     }
                 }
@@ -378,12 +385,12 @@ public class RaftNode {
                 term = param.getTerm();
                 votedFor = param.getCandidateAddr();
                 preElectionTime = System.currentTimeMillis();
-                log.info("node {} vote for candidate: {}", myAddr, param.getCandidateAddr());
+                log.info("vote for candidate: {}", param.getCandidateAddr());
                 // 返回成功
                 return builder.term(term).voteGranted(true).build();
             }
 
-            log.info("node {} decline to vote for candidate {} because there is no vote available", myAddr, param.getCandidateAddr());
+            log.info("node decline to vote for candidate {} because there is no vote available", param.getCandidateAddr());
             return builder.term(term).voteGranted(false).build();
 
         } finally {
@@ -416,10 +423,13 @@ public class RaftNode {
             // leader = "";
             term++;
             votedFor = myAddr;
-            log.info("node {} become CANDIDATE and start election, its term : [{}], LastEntry : [{}]",
-                    myAddr, term, logModule.getLast());
+            log.info("node become CANDIDATE and start election, its term : [{}], LastEntry : [{}]",
+                    term, logModule.getLast());
 
             ArrayList<Future<VoteResult>> futureArrayList = new ArrayList<>();
+
+            // 计数器
+            CountDownLatch latch = new CountDownLatch(peerAddrs.size());
 
             // 发送投票请求
             for (String peer : peerAddrs) {
@@ -448,84 +458,76 @@ public class RaftNode {
                             .build();
 
                     try {
-                        // 任务执行完成后，会在 future 里放置 VoteResult 对象
+                        // rpc 调用
                         return rpcClient.send(request);
                     } catch (Exception e) {
                         log.error("ElectionTask RPC Fail , URL : " + request.getUrl());
                         return null;
-                    }
-                }));
-            }
-            log.info("futureArrayList.size() : {}", futureArrayList.size());
-
-            // 统计赞同票的数量
-            AtomicInteger success2 = new AtomicInteger(0);
-
-            // 计数器
-            CountDownLatch latch = new CountDownLatch(futureArrayList.size());
-
-            // 利用多线程获取结果
-            for (Future<VoteResult> future : futureArrayList) {
-                te.submit(() -> {
-                    try {
-                        VoteResult result = future.get(1000, MILLISECONDS);
-                        if (result == null) {
-                            // rpc调用失败或任务超时
-                            return -1;
-                        }
-                        boolean isVoteGranted = result.isVoteGranted();
-
-                        if (isVoteGranted) {
-                            success2.incrementAndGet();
-                        } else {
-                            // 更新自己的任期
-                            long resTerm =result.getTerm();
-                            if (resTerm >= term) {
-                                term = resTerm;
-                            }
-                        }
-                        return 0;
-                    } catch (Exception e) {
-                        log.error("future.get exception");
-                        return -1;
                     } finally {
                         latch.countDown();
                     }
-                });
+                }));
             }
 
             try {
                 // 等待子线程完成选票统计
-                latch.await(3500, MILLISECONDS);
+                latch.await(3000, MILLISECONDS);
             } catch (InterruptedException e) {
                 log.warn("InterruptedException By Master election Task");
             }
 
-            // 总票数
-            int success = success2.get();
+            // 统计赞同票的数量
+            int votes = 0;
+
+            // 获取结果
+            for (Future<VoteResult> future : futureArrayList) {
+                try {
+                    VoteResult result = future.get();
+                    if (result == null) {
+                        // rpc调用失败或任务超时
+                        continue;
+                    }
+
+                    if (result.isVoteGranted()) {
+                        votes++;
+                    } else {
+                        // 更新自己的任期
+                        long resTerm =result.getTerm();
+                        if (resTerm > term) {
+                            term = resTerm;
+                            status = FOLLOWER;
+                        }
+                    }
+                } catch (Exception e) {
+                    log.error("future.get() exception");
+                }
+            }
 
             // 如果投票期间有其他服务器发送 appendEntry , 就可能变成 follower
             if (status == FOLLOWER) {
-                log.info("node {} election stops with new appendEntry", myAddr);
+                log.info("election stops with newer term {}", term);
                 preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
+                votedFor = "";
                 return;
             }
 
             // 需要获得超过半数节点的投票
-            if (success * 2 >= peerAddrs.size()) {
-                log.warn("node {} become leader with {} votes ", myAddr, success);
+            if (votes * 2 >= peerAddrs.size()) {
                 votedFor = "";
-                if (leaderInit())
+                if (leaderInit()) {
                     status = LEADER;
+                    log.warn("become leader with {} votes ", votes);
+                }
             }
 
             // 未赢得过半的投票，或提交no-op空日志失败
             if (status != LEADER){
                 // 重新选举
-                log.info("node {} election fail, votes count = {} ", myAddr, success);
+                log.info("node {} election fail, votes count = {} ", myAddr, votes);
                 votedFor = "";
                 status = FOLLOWER;
             }
+
             // 更新时间
             preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
 
@@ -539,9 +541,9 @@ public class RaftNode {
      * 3. apply no-op之前的日志
      */
     private boolean leaderInit() {
-        nextIndexs = new ConcurrentHashMap<>();
+        nextIndexes = new ConcurrentHashMap<>();
         for (String peer : peerAddrs) {
-            nextIndexs.put(peer, logModule.getLastIndex() + 1);
+            nextIndexes.put(peer, logModule.getLastIndex() + 1);
         }
 
         // no-op 空日志
@@ -749,7 +751,7 @@ public class RaftNode {
                         .build();
 
                 // 2. 生成日志数组
-                Long nextIndex = nextIndexs.get(peer);
+                Long nextIndex = nextIndexes.get(peer);
                 List<LogEntry> logEntries = new ArrayList<>();
                 if (entry.getIndex() >= nextIndex) {
                     // 把 nextIndex ~ entry.index 之间的日志都加入list
@@ -787,7 +789,7 @@ public class RaftNode {
                     if (result.isSuccess()) {
                         log.info("append follower entry success, follower=[{}], entry=[{}]", peer, appendParam.getEntries());
                         // update 这两个追踪值
-                        nextIndexs.put(peer, entry.getIndex() + 1);
+                        nextIndexes.put(peer, entry.getIndex() + 1);
                         return true;
                     } else  {
                         // 失败情况1：对方任期比我大，转变成跟随者
@@ -799,7 +801,7 @@ public class RaftNode {
                             return false;
                         } else {
                             // 失败情况2：preLog不匹配，nextIndex递减
-                            nextIndexs.put(peer, Math.max(nextIndex - 1, 0));
+                            nextIndexes.put(peer, Math.max(nextIndex - 1, 0));
                             log.warn("follower {} nextIndex not match, will reduce nextIndex and retry append, nextIndex : [{}]", peer,
                                     nextIndex);
                             // 重来, 直到成功.
