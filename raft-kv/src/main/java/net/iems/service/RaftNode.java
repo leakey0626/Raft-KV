@@ -5,6 +5,7 @@ import io.netty.util.internal.StringUtil;
 import lombok.extern.slf4j.Slf4j;
 import net.iems.service.config.RaftConfig;
 import net.iems.service.constant.Command;
+import net.iems.service.constant.CommandType;
 import net.iems.service.constant.NodeStatus;
 import net.iems.service.db.StateMachine;
 import net.iems.service.log.LogEntry;
@@ -109,6 +110,7 @@ public class RaftNode {
         peerAddrs.remove(myAddr);
     }
 
+
     /**
      * 初始化线程池
      */
@@ -131,6 +133,7 @@ public class RaftNode {
         ss.scheduleWithFixedDelay(new HeartBeatTask(), 0, heartBeatInterval, TimeUnit.MILLISECONDS);
         ss.scheduleAtFixedRate(new ElectionTask(), 3000, 100, TimeUnit.MILLISECONDS);
     }
+
 
     /**
      * 处理客户端请求
@@ -170,10 +173,11 @@ public class RaftNode {
 
         // 写操作
         LogEntry logEntry = LogEntry.builder()
-                .command(Command.builder().
-                        key(request.getKey()).
-                        value(request.getValue()).
-                        build())
+                .command(Command.builder()
+                        .key(request.getKey())
+                        .value(request.getValue())
+                        .type(CommandType.PUT)
+                        .build())
                 .term(term)
                 .requestId(request.getRequestId())
                 .build();
@@ -230,6 +234,27 @@ public class RaftNode {
         }
     }
 
+
+    /**
+     * 转发给leader处理（重定向）
+     * @param request
+     * @return
+     */
+    public ClientResponse redirect(ClientRequest request){
+        Request r = Request.builder()
+                .obj(request)
+                .cmd(Request.CLIENT_REQ)
+                .url(leader)
+                .build();
+        try {
+            return rpcClient.send(r);
+        } catch (RemotingException | InterruptedException e) {
+            log.error("Redirect to leader fail. Please try again.");
+        }
+        return ClientResponse.fail();
+    }
+
+
     /**
      * 处理来自其它节点的非选举请求（心跳或追加日志）
      */
@@ -248,13 +273,13 @@ public class RaftNode {
             preElectionTime = System.currentTimeMillis();
             leader = param.getLeaderId();
 
-            // 够格
+            // 收到了新领导者的 append entry 请求，转为跟随者
             if (status != FOLLOWER) {
                 log.info("node {} become FOLLOWER, term : {}, param Term : {}",
                         myAddr, term, param.getTerm());
-                // 收到了新领导者的append entry请求，转为跟随者
                 status = NodeStatus.FOLLOWER;
             }
+
             // 更新term
             term = param.getTerm();
 
@@ -284,7 +309,7 @@ public class RaftNode {
                     // 任期号不匹配
                     return result;
                 }
-            } // else ... 前一个日志不存在时，无需查看任期号
+            }
 
             // 2. 清理多余的旧日志
             long curIdx = param.getPrevLogIndex() + 1;
@@ -314,7 +339,8 @@ public class RaftNode {
             appendLock.unlock();
         }
     }
-    
+
+
     /**
      * 处理来自其它节点的投票请求
      */
@@ -365,31 +391,7 @@ public class RaftNode {
         }
     }
 
-    /**
-     * 转发给leader处理（重定向）
-     * @param request
-     * @return
-     */
-    public ClientResponse redirect(ClientRequest request){
-        Request r = Request.builder()
-                .obj(request)
-                .cmd(Request.CLIENT_REQ).build();
-        while (true){
-            r.setUrl(leader);
-            try {
-                return rpcClient.send(r);
-            } catch (RemotingException | InterruptedException e) {
-                log.error("Redirect to leader fail. Try again.", e);
-            }
-            try {
-                Thread.sleep(500);
-            } catch (InterruptedException e) {
-                log.error("Redirect interrupted.", e);
-                return ClientResponse.fail();
-            }
-        }
-    }
-    
+
     /**
      * 发起选举
      */
@@ -530,6 +532,7 @@ public class RaftNode {
         }
     }
 
+
     /**
      * 1. 初始化所有的 nextIndex 值为自己的最后一条日志的 index + 1
      * 2. 发送并提交no-op空日志，以提交旧领导者未提交的日志
@@ -600,13 +603,16 @@ public class RaftNode {
         }
     }
 
+
     private void setCommitIndex(long index) {
         stateMachine.setCommit(index);
     }
 
+
     private long getCommitIndex() {
         return stateMachine.getCommit();
     }
+
 
     /**
      * 发送心跳信号，通过线程池执行
@@ -672,6 +678,9 @@ public class RaftNode {
 
             try {
                 // 等待 replicationResult 中的线程执行完毕
+
+                // TODO 这里的 await 会影响下一次心跳
+
                 latch.await(3000, MILLISECONDS);
             } catch (InterruptedException e) {
                 log.error(e.getMessage(), e);
@@ -692,6 +701,7 @@ public class RaftNode {
         }
     }
 
+
     /**
      * 等待 future 对应的线程执行完毕，将结果写入 resultList
      * @param futureList
@@ -704,7 +714,7 @@ public class RaftNode {
                 try {
                     resultList.add(future.get(3000, MILLISECONDS));
                 } catch (Exception e) {
-                    log.error(e.getMessage(), e);
+                    log.warn("future get error in replicationResult");
                     resultList.add(false);
                 } finally {
                     latch.countDown();
@@ -712,6 +722,7 @@ public class RaftNode {
             });
         }
     }
+
 
     /**
      * 复制日志到跟随者节点
@@ -723,23 +734,23 @@ public class RaftNode {
 
         return te.submit(() -> {
 
-            long start = System.currentTimeMillis(), end = start;
+            long start = System.currentTimeMillis();
+            long end = start;
 
             // 5秒重试时间
             while (end - start < 5 * 1000L) {
 
                 // 1. 封装append entry请求基本参数
-                AppendParam appendParam = AppendParam.builder().build();
-                appendParam.setTerm(term);
-                appendParam.setServerId(peer);
-                appendParam.setLeaderId(myAddr);
-                appendParam.setLeaderCommit(stateMachine.getCommit());
-
-                Long nextIndex = nextIndexs.get(peer);
+                AppendParam appendParam = AppendParam.builder()
+                        .leaderId(myAddr)
+                        .term(term)
+                        .leaderCommit(getCommitIndex())
+                        .serverId(peer)
+                        .build();
 
                 // 2. 生成日志数组
-                nextIndex = nextIndexs.get(peer);
-                LinkedList<LogEntry> logEntries = new LinkedList<>();
+                Long nextIndex = nextIndexs.get(peer);
+                List<LogEntry> logEntries = new ArrayList<>();
                 if (entry.getIndex() >= nextIndex) {
                     // 把 nextIndex ~ entry.index 之间的日志都加入list
                     for (long i = nextIndex; i <= entry.getIndex(); i++) {
@@ -754,7 +765,7 @@ public class RaftNode {
                 appendParam.setEntries(logEntries.toArray(new LogEntry[0]));
 
                 // 3. 设置preLog相关参数，用于日志匹配
-                LogEntry preLog = getPreLog(logEntries.getFirst());
+                LogEntry preLog = getPreLog(logEntries.get(0));
                 // preLog不存在时，下述参数会被设为-1
                 appendParam.setPreLogTerm(preLog.getTerm());
                 appendParam.setPrevLogIndex(preLog.getIndex());
@@ -798,16 +809,18 @@ public class RaftNode {
                     end = System.currentTimeMillis();
 
                 } catch (Exception e) {
-                    log.error("Append Entry RPC Fail, request URL : {} ", request.getUrl());
+                    log.error("Append entry RPC fail, request URL : {} ", peer);
                     return false;
                 }
             }
 
             // 超时了
+            log.error("Append entry RPC timeout, request URL : {} ", peer);
             return false;
         });
 
     }
+
 
     /**
      * 获取logEntry的前一个日志
@@ -819,7 +832,7 @@ public class RaftNode {
         LogEntry entry = logModule.read(logEntry.getIndex() - 1);
 
         if (entry == null) {
-            log.warn("perLog is null, parameter logEntry : {}", logEntry);
+            log.info("perLog is null, parameter logEntry : {}", logEntry);
             entry = LogEntry.builder().index(-1L).term(-1).command(null).build();
         }
         return entry;

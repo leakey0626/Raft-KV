@@ -60,16 +60,31 @@ public class RaftClientRPC {
         return (String) response.getResult();
     }
 
-    /**
-     * @param key
-     * @param value
-     * @return
-     */
     public String put(String key, String value, String requestId) {
         int index = (int) (count.incrementAndGet() % list.size());
 
         String addr = list.get(index);
         ClientRequest obj = ClientRequest.builder().key(key).value(value).type(ClientRequest.PUT).requestId(requestId).build();
+
+        Request r = Request.builder().obj(obj).url(addr).cmd(Request.CLIENT_REQ).build();
+        ClientResponse response = null;
+        while (response == null || response.getResult().equals("fail")){
+            // 不断重试，直到获取服务端响应
+            try {
+                response = CLIENT.send(r);
+            } catch (Exception e) {
+                r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
+            }
+        }
+
+        return (String) response.getResult();
+    }
+
+    public String del(String key, String value, String requestId) {
+        int index = (int) (count.incrementAndGet() % list.size());
+
+        String addr = list.get(index);
+        ClientRequest obj = ClientRequest.builder().key(key).value(value).type(ClientRequest.DEL).requestId(requestId).build();
 
         Request r = Request.builder().obj(obj).url(addr).cmd(Request.CLIENT_REQ).build();
         ClientResponse response = null;

@@ -2,6 +2,8 @@ package net.iems.service.constant;
 
 import lombok.*;
 
+import java.io.Serializable;
+
 /**
  * 客户端命令
  * Created by 大东 on 2023/2/24.
@@ -11,7 +13,7 @@ import lombok.*;
 @ToString
 @Builder
 @AllArgsConstructor
-public class Command {
+public class Command implements Serializable {
 
     /**
      * 操作类型

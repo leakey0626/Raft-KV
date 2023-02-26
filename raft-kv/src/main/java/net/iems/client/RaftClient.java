@@ -16,7 +16,7 @@ public class RaftClient {
 
         RaftClientRPC rpc = new RaftClientRPC();
         InetAddress localHost = InetAddress.getLocalHost();
-        String prefix = localHost.getHostAddress() + UUID.randomUUID().toString().substring(0, 5);
+        String prefix = localHost.getHostAddress() + ":" + UUID.randomUUID().toString().substring(0, 5) + ":";
         int cnt = 0;
         // 从键盘接收数据
         Scanner scan = new Scanner(System.in);
@@ -46,13 +46,15 @@ public class RaftClient {
                 System.out.println(rpc.get(raftArgs[1], prefix + cnt++));
             }
 
-            // put [key] [value]
+            // [op] [key] [value]
             if (n == 3){
-                if (!raftArgs[0].equals("put")){
+                if (raftArgs[0].equals("put")){
+                    System.out.println(rpc.put(raftArgs[1], raftArgs[2], prefix + cnt++));
+                } else if (raftArgs[0].equals("delete")){
+                    System.out.println(rpc.del(raftArgs[1], raftArgs[2], prefix + cnt++));
+                } else {
                     System.out.println("invalid input");
-                    continue;
                 }
-                System.out.println(rpc.put(raftArgs[1], raftArgs[2], prefix + cnt++));
             }
         }
 

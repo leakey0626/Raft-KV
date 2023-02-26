@@ -4,7 +4,7 @@ import com.alipay.remoting.BizContext;
 import com.alipay.remoting.rpc.protocol.SyncUserProcessor;
 import lombok.extern.slf4j.Slf4j;
 import net.iems.service.RaftNode;
-import net.iems.proto.*;
+import net.iems.service.proto.*;
 import net.iems.service.proto.*;
 
 /**

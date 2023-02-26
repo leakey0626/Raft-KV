@@ -101,6 +101,11 @@ public class LogModule{
         }
     }
 
+    /**
+     * 根据索引读取日志
+     * @param index
+     * @return 日志条目 LogEntry 或 null
+     */
     public LogEntry read(Long index) {
         try {
             byte[] result = logDb.get(convert(index));
@@ -148,7 +153,7 @@ public class LogModule{
             }
             return JSON.parseObject(result, LogEntry.class);
         } catch (RocksDBException e) {
-            e.printStackTrace();
+            log.error("RocksDB getLast error", e);
         }
         return null;
     }
@@ -165,7 +170,7 @@ public class LogModule{
                 lastIndex = "-1".getBytes();
             }
         } catch (RocksDBException e) {
-            e.printStackTrace();
+            log.error("RocksDB getLastIndex error", e);
         }
         return Long.valueOf(new String(lastIndex));
     }
@@ -180,7 +185,7 @@ public class LogModule{
             // overWrite
             logDb.put(LAST_INDEX_KEY, index.toString().getBytes());
         } catch (RocksDBException e) {
-            e.printStackTrace();
+            log.error("RocksDB updateLastIndex error", e);
         }
     }
 

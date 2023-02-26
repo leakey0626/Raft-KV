@@ -19,6 +19,7 @@ public class ClientRequest implements Serializable {
     /** 操作类型 */
     public static int PUT = 0;
     public static int GET = 1;
+    public static int DEL = 2;
 
     int type;
 
