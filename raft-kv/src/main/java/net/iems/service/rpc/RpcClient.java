@@ -22,7 +22,7 @@ public class RpcClient {
     }
 
     public <R> R send(Request request) throws RemotingException, InterruptedException {
-        return send(request, 10);
+        return send(request, 100);
     }
 
     public <R> R send(Request request, int timeout) throws RemotingException, InterruptedException {

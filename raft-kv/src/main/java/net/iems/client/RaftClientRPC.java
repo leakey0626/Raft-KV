@@ -19,84 +19,132 @@ public class RaftClientRPC {
 
     private RpcClient CLIENT;
 
-    private AtomicLong count = new AtomicLong(3);
+    private int index;
+
+    private int size;
+
+    private String addr;
 
     public RaftClientRPC()  {
         CLIENT = new RpcClient();
         String[] arr = new String[]{"localhost:8775", "localhost:8776", "localhost:8777", "localhost:8778", "localhost:8779"};
         list = new ArrayList<>();
         Collections.addAll(list, arr);
+        size = list.size();
+        index = 0;
+        addr = list.get(index);
     }
 
     /**
      * @param key 查询的key值
      * @return
      */
-    public String get(String key, String requestId) {
+    public String get(String key, String requestId) throws InterruptedException {
 
         // raft客户端协议请求体
         ClientRequest obj = ClientRequest.builder().key(key).type(ClientRequest.GET).requestId(requestId).build();
-
-        int index = (int) (count.incrementAndGet() % list.size());
-
-        String addr = list.get(index);
 
         // rpc协议请求体
         Request r = Request.builder().obj(obj).url(addr).cmd(Request.CLIENT_REQ).build();
 
         ClientResponse response = null;
-        while (response == null){
-            // 不断重试，直到获取服务端响应
+        while (response == null || response.getCode() != 0){
+
+            // 不断重试，直到响应成功
             try {
                 response = CLIENT.send(r, 500);
             } catch (Exception e) {
-                r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
+                // 请求超时，连接下一个节点
+                index = (index + 1) % size;
+                addr = list.get(index);
+                r.setUrl(addr);
+                Thread.sleep(500);
+                continue;
             }
-        }
-        if (response.getResult() == null || response.getResult().equals("fail")){
-            return null;
+
+            // 解析响应数据
+            if (response.getCode() == -1){
+                index = (index + 1) % size;
+                r.setUrl(list.get(index));
+                Thread.sleep(500);
+            } else if (response.getCode() == 1){
+                // 重定向
+                addr = response.getResult().toString();
+                r.setUrl(addr);
+            }
         }
 
         return (String) response.getResult();
     }
 
-    public String put(String key, String value, String requestId) {
-        int index = (int) (count.incrementAndGet() % list.size());
+    public String put(String key, String value, String requestId) throws InterruptedException {
 
-        String addr = list.get(index);
         ClientRequest obj = ClientRequest.builder().key(key).value(value).type(ClientRequest.PUT).requestId(requestId).build();
 
         Request r = Request.builder().obj(obj).url(addr).cmd(Request.CLIENT_REQ).build();
         ClientResponse response = null;
-        while (response == null || response.getResult().equals("fail")){
-            // 不断重试，直到获取服务端响应
+        while (response == null || response.getCode() != 0){
+
+            // 不断重试，直到响应成功
             try {
                 response = CLIENT.send(r, 500);
             } catch (Exception e) {
-                r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
+                // 请求超时，连接下一个节点
+                index = (index + 1) % size;
+                addr = list.get(index);
+                r.setUrl(addr);
+                Thread.sleep(500);
+                continue;
+            }
+
+            // 解析响应数据
+            if (response.getCode() == -1){
+                index = (index + 1) % size;
+                addr = list.get(index);
+                r.setUrl(addr);
+                Thread.sleep(500);
+            } else if (response.getCode() == 1){
+                // 重定向
+                addr = response.getResult().toString();
+                r.setUrl(addr);
             }
         }
-
-        return (String) response.getResult();
+        return "ok";
     }
 
-    public String del(String key, String value, String requestId) {
-        int index = (int) (count.incrementAndGet() % list.size());
+    public String del(String key, String value, String requestId) throws InterruptedException {
 
-        String addr = list.get(index);
         ClientRequest obj = ClientRequest.builder().key(key).value(value).type(ClientRequest.DEL).requestId(requestId).build();
 
         Request r = Request.builder().obj(obj).url(addr).cmd(Request.CLIENT_REQ).build();
         ClientResponse response = null;
-        while (response == null || response.getResult().equals("fail")){
-            // 不断重试，直到获取服务端响应
+        while (response == null || response.getCode() != 0){
+
+            // 不断重试，直到响应成功
             try {
                 response = CLIENT.send(r, 500);
             } catch (Exception e) {
-                r.setUrl(list.get((int) ((count.incrementAndGet()) % list.size())));
+                // 请求超时，连接下一个节点
+                index = (index + 1) % size;
+                addr = list.get(index);
+                r.setUrl(addr);
+                Thread.sleep(500);
+                continue;
+            }
+
+            // 解析响应数据
+            if (response.getCode() == -1){
+                index = (index + 1) % size;
+                addr = list.get(index);
+                r.setUrl(addr);
+                Thread.sleep(500);
+            } else if (response.getCode() == 1){
+                // 重定向
+                addr = response.getResult().toString();
+                r.setUrl(addr);
             }
         }
-
-        return (String) response.getResult();
+        return "ok";
     }
+
 }

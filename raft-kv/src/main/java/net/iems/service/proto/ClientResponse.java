@@ -14,45 +14,37 @@ import java.io.Serializable;
 @ToString
 public class ClientResponse implements Serializable {
 
+    /**
+     * 响应码
+     * ok -- 0
+     * fail -- -1
+     * redirect -- 1
+     */
+    int code;
+
     /** 响应携带数据 */
     Object result;
 
-    public ClientResponse(Object result) {
+    private ClientResponse(int code, Object result) {
+        this.code = code;
         this.result = result;
     }
 
-    private ClientResponse(Builder builder) {
-        setResult(builder.result);
+    public static ClientResponse ok() {
+        return new ClientResponse(0, null);
     }
 
-    public static ClientResponse ok() {
-        return new ClientResponse("ok");
+    public static ClientResponse ok(String value) {
+        return new ClientResponse(0, value);
     }
 
     public static ClientResponse fail() {
-        return new ClientResponse("fail");
+        return new ClientResponse(-1, null);
+    }
+
+    public static ClientResponse redirect(String addr) {
+        return new ClientResponse(1, addr);
     }
 
 
-    public static Builder newBuilder() {
-        return new Builder();
-    }
-
-
-    public static final class Builder {
-
-        private Object result;
-
-        private Builder() {
-        }
-
-        public Builder result(Object val) {
-            result = val;
-            return this;
-        }
-
-        public ClientResponse build() {
-            return new ClientResponse(this);
-        }
-    }
 }
