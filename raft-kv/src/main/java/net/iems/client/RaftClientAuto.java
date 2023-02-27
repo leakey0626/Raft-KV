@@ -18,8 +18,8 @@ public class RaftClientAuto {
         String prefix = localHost.getHostAddress() + UUID.randomUUID().toString().substring(0, 5);
 
         for (int i = 3; i > -1; i++) {
-            String key = "[test4:" + i +"]";
-            String value = "[test4:" + i + "]";
+            String key = "[test c:" + i +"]";
+            String value = "[test c:" + i + "]";
             // 客户端请求唯一id
             String requestId = prefix + i;
             try {
@@ -29,7 +29,7 @@ public class RaftClientAuto {
                 log.error(e.getMessage(), e);
             }
 
-            Thread.sleep(3000);
+            Thread.sleep(1000);
 
             try {
                 String res = rpc.get(key, requestId);
@@ -38,7 +38,7 @@ public class RaftClientAuto {
                 log.error(e.getMessage(), e);
             }
 
-            Thread.sleep(3000);
+            Thread.sleep(1000);
 
         }
 

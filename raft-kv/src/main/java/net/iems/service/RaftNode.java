@@ -70,6 +70,11 @@ public class RaftNode {
     private ScheduledExecutorService ss;
     private ThreadPoolExecutor te;
 
+    /** 定时任务 */
+    HeartBeatTask heartBeatTask;
+    ElectionTask electionTask;
+    ScheduledFuture<?> heartBeatFuture;
+
     /** RPC 客户端 */
     private RpcClient rpcClient;
 
@@ -77,16 +82,19 @@ public class RaftNode {
     private RpcServer rpcServer;
 
     /** 一致性信号 */
-    public final Integer consistencySignal = 1;
+    private final Integer consistencySignal = 1;
 
     /** 等待被一致性信号唤醒的线程 */
     Thread waitThread;
 
     /** 处理选举请求的锁 */
-    public final ReentrantLock voteLock = new ReentrantLock();
+    private final ReentrantLock voteLock = new ReentrantLock();
 
     /** 处理日志请求的锁 */
-    public final ReentrantLock appendLock = new ReentrantLock();
+    private final ReentrantLock appendLock = new ReentrantLock();
+
+    /** 领导者初始化信号 */
+    private boolean leaderInitializing;
 
     public RaftNode(){
         logModule = LogModule.getInstance();
@@ -102,7 +110,7 @@ public class RaftNode {
     private void setConfig(){
         heartBeatInterval = RaftConfig.heartBeatInterval;
         electionTimeout = RaftConfig.electionTimeout;
-        preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
+        updatePreElectionTime();
         preHeartBeatTime = System.currentTimeMillis();
         status = FOLLOWER;
         String port = System.getProperty("server.port");
@@ -116,6 +124,10 @@ public class RaftNode {
             term = last.getTerm();
         }
         waitThread = null;
+    }
+
+    private void updatePreElectionTime() {
+        preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
     }
 
 
@@ -138,8 +150,153 @@ public class RaftNode {
                 TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<Runnable>(queueSize));
 
-        ss.scheduleWithFixedDelay(new HeartBeatTask(), 0, heartBeatInterval, TimeUnit.MILLISECONDS);
-        ss.scheduleAtFixedRate(new ElectionTask(), 3000, 100, TimeUnit.MILLISECONDS);
+        heartBeatTask = new HeartBeatTask();
+        electionTask = new ElectionTask();
+        ss.scheduleAtFixedRate(electionTask, 3000, 100, TimeUnit.MILLISECONDS);
+    }
+
+
+    /**
+     * 处理来自其它节点的投票请求
+     */
+    public VoteResult requestVote(VoteParam param) {
+        //log.info("vote process for {}, its term {} ", param.getCandidateAddr(), param.getTerm());
+        try {
+            VoteResult.Builder builder = VoteResult.newBuilder();
+            voteLock.lock();
+
+            // 对方任期没有自己新
+            if (param.getTerm() < term) {
+                // 返回投票结果的同时更新对方的term
+                log.info("decline to vote for candidate {} because of smaller term", param.getCandidateAddr());
+                updatePreElectionTime();
+                return builder.term(term).voteGranted(false).build();
+            }
+
+            if ((StringUtil.isNullOrEmpty(votedFor) || votedFor.equals(param.getCandidateAddr()))) {
+                if (logModule.getLast() != null) {
+                    // 对方没有自己新
+                    if (logModule.getLast().getTerm() > param.getLastLogTerm()) {
+                        log.info("decline to vote for candidate {} because of older log term", param.getCandidateAddr());
+                        updatePreElectionTime();
+                        return VoteResult.fail();
+                    }
+                    // 对方没有自己新
+                    if (logModule.getLastIndex() > param.getLastLogIndex()) {
+                        log.info("node decline to vote for candidate {} because of older log index", param.getCandidateAddr());
+                        updatePreElectionTime();
+                        return VoteResult.fail();
+                    }
+                }
+
+                // 切换状态
+                status = FOLLOWER;
+                stopHeartBeat();
+
+                // 更新
+                leader = param.getCandidateAddr();
+                term = param.getTerm();
+                votedFor = param.getCandidateAddr();
+                updatePreElectionTime();
+                log.info("vote for candidate: {}", param.getCandidateAddr());
+                // 返回成功
+                return builder.term(term).voteGranted(true).build();
+            }
+
+            log.info("node decline to vote for candidate {} because there is no vote available", param.getCandidateAddr());
+            return builder.term(term).voteGranted(false).build();
+
+        } finally {
+            voteLock.unlock();
+        }
+    }
+
+
+    /**
+     * 处理来自其它节点的非选举请求（心跳或追加日志）
+     */
+    public AppendResult appendEntries(AppendParam param){
+        AppendResult result = AppendResult.fail();
+        try {
+            appendLock.lock();
+            result.setTerm(term);
+
+            // 请求方任期较低，直接拒绝
+            if (param.getTerm() < term) {
+                return result;
+            }
+
+            preHeartBeatTime = System.currentTimeMillis();
+            updatePreElectionTime();
+            leader = param.getLeaderId();
+
+            // 收到了新领导者的 append entry 请求，转为跟随者
+            if (status != FOLLOWER) {
+                log.info("node {} become FOLLOWER, term : {}, param Term : {}",
+                        myAddr, term, param.getTerm());
+                status = FOLLOWER;
+                stopHeartBeat();
+            }
+
+            // 更新term
+            term = param.getTerm();
+
+            //心跳
+            if (param.getEntries() == null || param.getEntries().length == 0) {
+//                log.info("receive heartbeat from node {}, term : {}",
+//                        param.getLeaderId(), param.getTerm());
+                // 旧日志提交
+                long nextCommit = getCommitIndex() + 1;
+                while (nextCommit <= param.getLeaderCommit()
+                        && logModule.read(nextCommit) != null){
+                    stateMachine.apply(logModule.read(nextCommit));
+                    nextCommit++;
+                }
+                setCommitIndex(nextCommit - 1);
+                return AppendResult.newBuilder().term(term).success(true).build();
+            }
+
+            // 1. preLog匹配判断
+            if (logModule.getLastIndex() < param.getPrevLogIndex()){
+                // 跟随者的最大日志索引小于请求体的 preLogIndex，无法通过日志匹配
+                return result;
+            } else if (param.getPrevLogIndex() >= 0) {
+                // preLogIndex 在跟随者的日志索引范围内，判断该日志的任期号是否相同
+                LogEntry preEntry = logModule.read(param.getPrevLogIndex());
+                if (preEntry.getTerm() != param.getPreLogTerm()) {
+                    // 任期号不匹配，领导者将选取更早的 preLog 并重试
+                    return result;
+                }
+            } // else ... 当 preLogIndex 是 -1 时，说明从第一个日志开始复制，此时必然是能够匹配的
+
+            // 2. 清理多余的旧日志
+            long curIdx = param.getPrevLogIndex() + 1;
+            if (logModule.read(curIdx) != null){
+                // 只保留 [0..preLogIndex] 内的日志条目
+                logModule.removeOnStartIndex(curIdx);
+            }
+
+            // 3. 追加日志到本地文件
+            LogEntry[] entries = param.getEntries();
+            for (LogEntry logEntry : entries) {
+                logModule.write(logEntry);
+            }
+
+            // 4. 旧日志提交
+            long nextCommit = getCommitIndex() + 1;
+            while (nextCommit <= param.getLeaderCommit()){
+                stateMachine.apply(logModule.read(nextCommit));
+                nextCommit++;
+            }
+            setCommitIndex(nextCommit - 1);
+
+            // 5. 同意append entry请求
+            result.setSuccess(true);
+            return result;
+
+        } finally {
+            appendLock.unlock();
+        }
     }
 
 
@@ -151,8 +308,13 @@ public class RaftNode {
                 ClientRequest.Type.value(request.getType()), request.getKey(), request.getValue());
 
         if (status != LEADER) {
-            log.warn("I am not leader, invoke redirect method, leader addr : {}", leader);
+            log.warn("redirect to leader: {}", leader);
             return redirect(request);
+        }
+
+        if (leaderInitializing){
+            log.error("the leader is initializing, please try again later");
+            return ClientResponse.fail();
         }
 
         // 读操作
@@ -207,25 +369,14 @@ public class RaftNode {
         }
 
         try {
-            // 等待replicationResult中的线程执行完毕
+            // 等待 replication 中的线程执行完毕
             latch.await(6000, MILLISECONDS);
         } catch (InterruptedException e) {
             log.error(e.getMessage(), e);
         }
 
         // 统计日志复制结果
-        int success = 0;
-        for (Future<Boolean> future : futureList) {
-            if (future.isDone()){
-                try {
-                    if (future.get()){
-                        success++;
-                    }
-                } catch (InterruptedException | ExecutionException e) {
-                    log.error("future.get() error");
-                }
-            }
-        }
+        int success = getReplicationResult(futureList);
 
         if (success * 2 >= peerAddrs.size()) {
             // 更新
@@ -266,146 +417,6 @@ public class RaftNode {
 
 
     /**
-     * 处理来自其它节点的非选举请求（心跳或追加日志）
-     */
-    public AppendResult appendEntries(AppendParam param){
-        AppendResult result = AppendResult.fail();
-        try {
-            appendLock.lock();
-            result.setTerm(term);
-
-            // 请求方任期较低，直接拒绝
-            if (param.getTerm() < term) {
-                return result;
-            }
-
-            preHeartBeatTime = System.currentTimeMillis();
-            preElectionTime = System.currentTimeMillis();
-            leader = param.getLeaderId();
-
-            // 收到了新领导者的 append entry 请求，转为跟随者
-            if (status != FOLLOWER) {
-                log.info("node {} become FOLLOWER, term : {}, param Term : {}",
-                        myAddr, term, param.getTerm());
-                status = NodeStatus.FOLLOWER;
-            }
-
-            // 更新term
-            term = param.getTerm();
-
-            //心跳
-            if (param.getEntries() == null || param.getEntries().length == 0) {
-//                log.info("receive heartbeat from node {}, term : {}",
-//                        param.getLeaderId(), param.getTerm());
-                // 旧日志提交
-                long nextCommit = getCommitIndex() + 1;
-                while (nextCommit <= param.getLeaderCommit()
-                        && logModule.read(nextCommit) != null){
-                    stateMachine.apply(logModule.read(nextCommit));
-                    nextCommit++;
-                }
-                setCommitIndex(nextCommit - 1);
-                return AppendResult.newBuilder().term(term).success(true).build();
-            }
-
-            // 1. preLog匹配判断
-            if (logModule.getLastIndex() != param.getPrevLogIndex()){
-                // index不匹配
-                return result;
-            } else if (param.getPrevLogIndex() >= 0) {
-                // index匹配且前一个日志存在，比较任期号
-                LogEntry preEntry = logModule.read(param.getPrevLogIndex());
-                if (preEntry.getTerm() != param.getPreLogTerm()) {
-                    // 任期号不匹配
-                    return result;
-                }
-            }
-
-            // 2. 清理多余的旧日志
-            long curIdx = param.getPrevLogIndex() + 1;
-            if (logModule.read(curIdx) != null){
-                logModule.removeOnStartIndex(curIdx);
-            }
-
-            // 3. 追加日志到本地文件
-            LogEntry[] entries = param.getEntries();
-            for (LogEntry logEntry : entries) {
-                logModule.write(logEntry);
-            }
-
-            // 4. 旧日志提交
-            long nextCommit = getCommitIndex() + 1;
-            while (nextCommit <= param.getLeaderCommit()){
-                stateMachine.apply(logModule.read(nextCommit));
-                nextCommit++;
-            }
-            setCommitIndex(nextCommit - 1);
-
-            // 5. 同意append entry请求
-            result.setSuccess(true);
-            return result;
-
-        } finally {
-            appendLock.unlock();
-        }
-    }
-
-
-    /**
-     * 处理来自其它节点的投票请求
-     */
-    public VoteResult requestVote(VoteParam param) {
-        //log.info("vote process for {}, its term {} ", param.getCandidateAddr(), param.getTerm());
-        try {
-            VoteResult.Builder builder = VoteResult.newBuilder();
-            voteLock.lock();
-
-            // 对方任期没有自己新
-            if (param.getTerm() < term) {
-                // 返回投票结果的同时更新对方的term
-                log.info("decline to vote for candidate {} because of smaller term", param.getCandidateAddr());
-                preElectionTime = System.currentTimeMillis();
-                return builder.term(term).voteGranted(false).build();
-            }
-
-            if ((StringUtil.isNullOrEmpty(votedFor) || votedFor.equals(param.getCandidateAddr()))) {
-                if (logModule.getLast() != null) {
-                    // 对方没有自己新
-                    if (logModule.getLast().getTerm() > param.getLastLogTerm()) {
-                        log.info("decline to vote for candidate {} because of older log term", param.getCandidateAddr());
-                        preElectionTime = System.currentTimeMillis();
-                        return VoteResult.fail();
-                    }
-                    // 对方没有自己新
-                    if (logModule.getLastIndex() > param.getLastLogIndex()) {
-                        log.info("node decline to vote for candidate {} because of older log index", param.getCandidateAddr());
-                        preElectionTime = System.currentTimeMillis();
-                        return VoteResult.fail();
-                    }
-                }
-
-                // 切换状态
-                status = NodeStatus.FOLLOWER;
-                // 更新
-                leader = param.getCandidateAddr();
-                term = param.getTerm();
-                votedFor = param.getCandidateAddr();
-                preElectionTime = System.currentTimeMillis();
-                log.info("vote for candidate: {}", param.getCandidateAddr());
-                // 返回成功
-                return builder.term(term).voteGranted(true).build();
-            }
-
-            log.info("node decline to vote for candidate {} because there is no vote available", param.getCandidateAddr());
-            return builder.term(term).voteGranted(false).build();
-
-        } finally {
-            voteLock.unlock();
-        }
-    }
-
-
-    /**
      * 发起选举
      */
     class ElectionTask implements Runnable{
@@ -432,7 +443,7 @@ public class RaftNode {
             log.info("node become CANDIDATE and start election, its term : [{}], LastEntry : [{}]",
                     term, logModule.getLast());
 
-            ArrayList<Future<VoteResult>> futureArrayList = new ArrayList<>();
+            ArrayList<Future<VoteResult>> futureList = new ArrayList<>();
 
             // 计数器
             CountDownLatch latch = new CountDownLatch(peerAddrs.size());
@@ -440,7 +451,7 @@ public class RaftNode {
             // 发送投票请求
             for (String peer : peerAddrs) {
                 // 执行rpc调用并加入list；添加的是submit的返回值
-                futureArrayList.add(te.submit(() -> {
+                futureList.add(te.submit(() -> {
                     long lastLogTerm = 0L;
                     long lastLogIndex = 0L;
                     LogEntry lastLog = logModule.getLast();
@@ -479,14 +490,14 @@ public class RaftNode {
                 // 等待子线程完成选票统计
                 latch.await(3000, MILLISECONDS);
             } catch (InterruptedException e) {
-                log.warn("InterruptedException By Master election Task");
+                log.warn("election task interrupted by main thread");
             }
 
             // 统计赞同票的数量
             int votes = 0;
 
             // 获取结果
-            for (Future<VoteResult> future : futureArrayList) {
+            for (Future<VoteResult> future : futureList) {
                 try {
                     VoteResult result = null;
                     if (future.isDone()){
@@ -515,7 +526,7 @@ public class RaftNode {
             // 如果投票期间有其他服务器发送 appendEntry , 就可能变成 follower
             if (status == FOLLOWER) {
                 log.info("election stops with newer term {}", term);
-                preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
+                updatePreElectionTime();
                 votedFor = "";
                 return;
             }
@@ -523,23 +534,21 @@ public class RaftNode {
             // 需要获得超过半数节点的投票
             if (votes * 2 >= peerAddrs.size()) {
                 votedFor = "";
-                if (leaderInit()) {
-                    status = LEADER;
-                    log.warn("become leader with {} votes ", votes);
-                }
-            }
-
-            // 未赢得过半的投票，或提交no-op空日志失败
-            if (status != LEADER){
+                status = LEADER;
+                // 启动心跳任务
+                heartBeatFuture = ss.scheduleWithFixedDelay(heartBeatTask, 0, heartBeatInterval, TimeUnit.MILLISECONDS);
+                log.warn("become leader with {} votes ", votes);
+            } else {
                 // 重新选举
-                log.info("node {} election fail, votes count = {} ", myAddr, votes);
                 votedFor = "";
                 status = FOLLOWER;
+                log.info("node {} election fail, votes count = {} ", myAddr, votes);
             }
 
             // 更新时间
-            preElectionTime = System.currentTimeMillis() + ThreadLocalRandom.current().nextInt(10) * 100;
-
+            updatePreElectionTime();
+            // 初始化
+            leaderInit();
         }
     }
 
@@ -549,7 +558,8 @@ public class RaftNode {
      * 2. 发送并提交no-op空日志，以提交旧领导者未提交的日志
      * 3. apply no-op之前的日志
      */
-    private boolean leaderInit() {
+    private void leaderInit() {
+        leaderInitializing = true;
         nextIndexes = new ConcurrentHashMap<>();
         for (String peer : peerAddrs) {
             nextIndexes.put(peer, logModule.getLastIndex() + 1);
@@ -578,22 +588,11 @@ public class RaftNode {
             // 等待replicationResult中的线程执行完毕
             latch.await(6000, MILLISECONDS);
         } catch (InterruptedException e) {
-            log.error(e.getMessage(), e);
+            log.error("latch timeout in leaderInit()");
         }
 
         // 统计日志复制结果
-        int success = 0;
-        for (Future<Boolean> future : futureList) {
-            if (future.isDone()){
-                try {
-                    if (future.get()){
-                        success++;
-                    }
-                } catch (InterruptedException | ExecutionException e) {
-                    log.error("future.get() error");
-                }
-            }
-        }
+        int success = getReplicationResult(futureList);
 
         //  响应客户端(成功一半及以上)
         if (success * 2 >= peerAddrs.size()) {
@@ -605,25 +604,16 @@ public class RaftNode {
             }
             setCommitIndex(logEntry.getIndex());
             log.info("no-op successfully commit, log index: {}", logEntry.getIndex());
-            // 返回成功
-            return true;
         } else {
-            // 提交失败，删除日志
+            // 提交失败，删除日志，重新发起选举
             logModule.removeOnStartIndex(logEntry.getIndex());
             log.warn("no-op commit fail, election again");
-            return false;
+            status = FOLLOWER;
+            stopHeartBeat();
+
         }
+        leaderInitializing = false;
 
-    }
-
-
-    private void setCommitIndex(long index) {
-        stateMachine.setCommit(index);
-    }
-
-
-    private long getCommitIndex() {
-        return stateMachine.getCommit();
     }
 
 
@@ -684,7 +674,6 @@ public class RaftNode {
                 }));
             }
 
-            int success = 0;
             try {
                 // 等待任务线程执行完毕
                 latch.await(1000, MILLISECONDS);
@@ -692,17 +681,7 @@ public class RaftNode {
                 log.error(e.getMessage(), e);
             }
 
-            for (Future<Boolean> future : futureList) {
-                if (future.isDone()) {
-                    try {
-                        if (future.get()){
-                            success++;
-                        }
-                    } catch (InterruptedException | ExecutionException e) {
-                        log.warn("future get error in heart beat task");
-                    }
-                }
-            }
+            int success = getReplicationResult(futureList);
 
             //  心跳响应成功，通知阻塞的线程
             if (waitThread != null){
@@ -720,11 +699,19 @@ public class RaftNode {
 
 
     /**
+     * 变为跟随者时停止心跳任务
+     */
+    private void stopHeartBeat() {
+        if(heartBeatFuture != null){
+            heartBeatFuture.cancel(true);
+            heartBeatFuture = null;
+        }
+    }
+
+
+    /**
      * 复制日志到跟随者节点
-     * @param peer 跟随者节点
-     * @param entry 日志条目
-     * @param latch
-     * @return 线程执行结果
+     * preLog 不匹配时自动重试
      */
     public Future<Boolean> replication(String peer, LogEntry entry, CountDownLatch latch) {
 
@@ -733,52 +720,51 @@ public class RaftNode {
             long start = System.currentTimeMillis();
             long end = start;
 
+
+            // 1. 封装append entry请求基本参数
+            AppendParam appendParam = AppendParam.builder()
+                    .leaderId(myAddr)
+                    .term(term)
+                    .leaderCommit(getCommitIndex())
+                    .serverId(peer)
+                    .build();
+
+            // 2. 生成日志数组
+            Long nextIndex = nextIndexes.get(peer);
+            List<LogEntry> logEntryList = new ArrayList<>();
+            if (entry.getIndex() >= nextIndex) {
+                // 把 nextIndex ~ entry.index 之间的日志都加入list
+                for (long i = nextIndex; i <= entry.getIndex(); i++) {
+                    LogEntry l = logModule.read(i);
+                    if (l != null) {
+                        logEntryList.add(l);
+                    }
+                }
+            } else {
+                logEntryList.add(entry);
+            }
+
+            // 3. 设置preLog相关参数，用于日志匹配
+            LogEntry preLog = getPreLog(logEntryList.get(0));
+            // preLog不存在时，下述参数会被设为-1
+            appendParam.setPreLogTerm(preLog.getTerm());
+            appendParam.setPrevLogIndex(preLog.getIndex());
+
+            // 4. 封装RPC请求
+            Request request = Request.builder()
+                    .cmd(Request.A_ENTRIES)
+                    .obj(appendParam)
+                    .url(peer)
+                    .build();
+
             // preLog 不匹配时重试；重试超时时间为 5s
             while (end - start < 5 * 1000L) {
-
-                // 1. 封装append entry请求基本参数
-                AppendParam appendParam = AppendParam.builder()
-                        .leaderId(myAddr)
-                        .term(term)
-                        .leaderCommit(getCommitIndex())
-                        .serverId(peer)
-                        .build();
-
-                // 2. 生成日志数组
-                Long nextIndex = nextIndexes.get(peer);
-                List<LogEntry> logEntries = new ArrayList<>();
-                if (entry.getIndex() >= nextIndex) {
-                    // 把 nextIndex ~ entry.index 之间的日志都加入list
-                    for (long i = nextIndex; i <= entry.getIndex(); i++) {
-                        LogEntry l = logModule.read(i);
-                        if (l != null) {
-                            logEntries.add(l);
-                        }
-                    }
-                } else {
-                    logEntries.add(entry);
-                }
-                appendParam.setEntries(logEntries.toArray(new LogEntry[0]));
-
-                // 3. 设置preLog相关参数，用于日志匹配
-                LogEntry preLog = getPreLog(logEntries.get(0));
-                // preLog不存在时，下述参数会被设为-1
-                appendParam.setPreLogTerm(preLog.getTerm());
-                appendParam.setPrevLogIndex(preLog.getIndex());
-
-                // 4. 封装RPC请求
-                Request request = Request.builder()
-                        .cmd(Request.A_ENTRIES)
-                        .obj(appendParam)
-                        .url(peer)
-                        .build();
-
+                appendParam.setEntries(logEntryList.toArray(new LogEntry[0]));
                 try {
                     // 5. 发送RPC请求；同步调用，阻塞直到获取返回值
                     AppendResult result = rpcClient.send(request);
                     if (result == null) {
-                        // timeout
-                        log.error("Append entry RPC timeout, request URL : {} ", peer);
+                        log.error("follower responses with null result, request URL : {} ", peer);
                         latch.countDown();
                         return false;
                     }
@@ -794,15 +780,30 @@ public class RaftNode {
                             log.warn("follower [{}] term [{}], my term = [{}], so I will become follower",
                                     peer, result.getTerm(), term);
                             term = result.getTerm();
-                            status = NodeStatus.FOLLOWER;
+                            status = FOLLOWER;
+                            stopHeartBeat();
                             latch.countDown();
                             return false;
                         } else {
-                            // 失败情况2：preLog不匹配，nextIndex递减
+                            // 失败情况2：preLog不匹配
                             nextIndexes.put(peer, Math.max(nextIndex - 1, 0));
                             log.warn("follower {} nextIndex not match, will reduce nextIndex and retry append, nextIndex : [{}]", peer,
-                                    nextIndex);
-                            // 重来, 直到成功.
+                                    logEntryList.get(0).getIndex());
+
+                            // 更新 preLog 和 logEntryList
+                            LogEntry l = logModule.read(logEntryList.get(0).getIndex() - 1);
+                            if (l != null){
+                                logEntryList.add(0, l);
+                            } else {
+                                // l == null 说明前一次发送的 preLogIndex 已经来到 -1 的位置，正常情况下应该无条件匹配
+                                log.error("log replication from the beginning fail");
+                                latch.countDown();
+                                return false;
+                            }
+
+                            preLog = getPreLog(logEntryList.get(0));
+                            appendParam.setPreLogTerm(preLog.getTerm());
+                            appendParam.setPrevLogIndex(preLog.getIndex());
                         }
                     }
 
@@ -813,7 +814,9 @@ public class RaftNode {
                     latch.countDown();
                     return false;
                 }
+
             }
+
 
             // 超时了
             log.error("replication timeout, peer {}", peer);
@@ -821,6 +824,28 @@ public class RaftNode {
             return false;
         });
 
+    }
+
+
+    /**
+     * 读取日志复制结果
+     * @param futureList
+     * @return 响应成功的跟随者数量
+     */
+    private int getReplicationResult(List<Future<Boolean>> futureList) {
+        int success = 0;
+        for (Future<Boolean> future : futureList) {
+            if (future.isDone()){
+                try {
+                    if (future.get()){
+                        success++;
+                    }
+                } catch (InterruptedException | ExecutionException e) {
+                    log.error("future.get() error");
+                }
+            }
+        }
+        return success;
     }
 
 
@@ -834,10 +859,20 @@ public class RaftNode {
         LogEntry entry = logModule.read(logEntry.getIndex() - 1);
 
         if (entry == null) {
-            log.info("perLog is null, parameter logEntry : {}", logEntry);
+            log.info("preLog is null, parameter logEntry : {}", logEntry);
             entry = LogEntry.builder().index(-1L).term(-1).command(null).build();
         }
         return entry;
+    }
+
+
+    private void setCommitIndex(long index) {
+        stateMachine.setCommit(index);
+    }
+
+
+    private long getCommitIndex() {
+        return stateMachine.getCommit();
     }
 
 }
