@@ -22,7 +22,7 @@ public class RaftClient {
         Scanner scan = new Scanner(System.in);
 
         // nextLine方式接收字符串
-        System.out.println("Raft client is running");
+        System.out.println("Raft client is running, please input command:");
 
         while (scan.hasNextLine()){
             String input = scan.nextLine();
