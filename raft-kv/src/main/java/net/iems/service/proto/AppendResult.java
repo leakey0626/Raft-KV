@@ -15,6 +15,8 @@ import java.io.Serializable;
 @ToString
 public class AppendResult implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     /** 被请求方的任期号，用于领导人去更新自己 */
     long term;
 

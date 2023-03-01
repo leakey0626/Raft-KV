@@ -17,6 +17,8 @@ import java.io.Serializable;
 @Data
 public class VoteParam implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     /** 候选人的任期号  */
     private long term;
 

@@ -14,6 +14,7 @@ import java.io.Serializable;
 @Setter
 public class Response<T> implements Serializable {
 
+    private static final long serialVersionUID = 1L;
 
     private T result;
 

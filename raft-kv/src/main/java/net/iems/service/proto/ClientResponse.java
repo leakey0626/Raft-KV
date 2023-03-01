@@ -14,6 +14,8 @@ import java.io.Serializable;
 @ToString
 public class ClientResponse implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     /**
      * 响应码
      * ok -- 0

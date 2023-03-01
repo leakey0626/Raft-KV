@@ -16,6 +16,8 @@ import java.io.Serializable;
 @Builder
 public class ClientRequest implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     /** 操作类型 */
     public static int PUT = 0;
     public static int GET = 1;

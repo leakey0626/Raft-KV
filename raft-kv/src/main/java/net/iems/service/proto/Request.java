@@ -13,6 +13,8 @@ import java.io.Serializable;
 @Data
 public class Request implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     /** 请求投票 */
     public static final int R_VOTE = 0;
     /** 附加日志 */

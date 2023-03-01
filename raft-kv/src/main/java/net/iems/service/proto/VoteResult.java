@@ -13,6 +13,8 @@ import java.io.Serializable;
 @Setter
 public class VoteResult implements Serializable {
 
+    private static final long serialVersionUID = 1L;
+
     /**
      * 当前任期号，以便于候选人去更新自己的任期
      */
