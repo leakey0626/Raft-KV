@@ -149,7 +149,6 @@ public class RaftNode {
                 keepTime,
                 TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<Runnable>(queueSize));
-
         heartBeatTask = new HeartBeatTask();
         electionTask = new ElectionTask();
         ss.scheduleAtFixedRate(electionTask, 3000, 100, TimeUnit.MILLISECONDS);
@@ -361,17 +360,17 @@ public class RaftNode {
         log.info("write logModule success, logEntry info : {}, log index : {}", logEntry, logEntry.getIndex());
 
         List<Future<Boolean>> futureList = new ArrayList<>();
-        CountDownLatch latch = new CountDownLatch(peerAddrs.size());
+        Semaphore semaphore = new Semaphore(0);
 
         //  复制到其他机器
         for (String peer : peerAddrs) {
             // 并行发起 RPC 复制并获取响应
-            futureList.add(replication(peer, logEntry, latch));
+            futureList.add(replication(peer, logEntry, semaphore));
         }
 
         try {
             // 等待 replication 中的线程执行完毕
-            latch.await(6000, MILLISECONDS);
+            semaphore.tryAcquire((int) Math.floor((peerAddrs.size() + 1) / 2), 6000, MILLISECONDS);
         } catch (InterruptedException e) {
             log.error(e.getMessage(), e);
         }
@@ -432,7 +431,7 @@ public class RaftNode {
             }
 
             status = CANDIDATE;
-            // leader = "";
+            leader = "";
             term++;
             votedFor = myAddr;
             log.info("node become CANDIDATE and start election, its term : [{}], LastEntry : [{}]",
@@ -441,7 +440,7 @@ public class RaftNode {
             ArrayList<Future<VoteResult>> futureList = new ArrayList<>();
 
             // 计数器
-            CountDownLatch latch = new CountDownLatch(peerAddrs.size());
+            Semaphore semaphore = new Semaphore(0);
 
             // 发送投票请求
             for (String peer : peerAddrs) {
@@ -476,14 +475,14 @@ public class RaftNode {
                         log.error("ElectionTask RPC Fail , URL : " + request.getUrl());
                         return null;
                     } finally {
-                        latch.countDown();
+                        semaphore.release();
                     }
                 }));
             }
 
             try {
                 // 等待子线程完成选票统计
-                latch.await(3000, MILLISECONDS);
+                semaphore.tryAcquire((int) Math.floor((peerAddrs.size() + 1) / 2), 6000, MILLISECONDS);
             } catch (InterruptedException e) {
                 log.warn("election task interrupted by main thread");
             }
@@ -570,19 +569,19 @@ public class RaftNode {
         log.info("write no-op log success, log index: {}", logEntry.getIndex());
 
         List<Future<Boolean>> futureList = new ArrayList<>();
-        CountDownLatch latch = new CountDownLatch(peerAddrs.size());
+        Semaphore semaphore = new Semaphore(0);
 
         //  复制到其他机器
         for (String peer : peerAddrs) {
             // 并行发起 RPC 复制并获取响应
-            futureList.add(replication(peer, logEntry, latch));
+            futureList.add(replication(peer, logEntry, semaphore));
         }
 
         try {
             // 等待replicationResult中的线程执行完毕
-            latch.await(6000, MILLISECONDS);
+            semaphore.tryAcquire((int) Math.floor((peerAddrs.size() + 1) / 2), 6000, MILLISECONDS);
         } catch (InterruptedException e) {
-            log.error("latch timeout in leaderInit()");
+            log.error("semaphore timeout in leaderInit()");
         }
 
         // 统计日志复制结果
@@ -641,7 +640,7 @@ public class RaftNode {
                     .build();
 
             List<Future<Boolean>> futureList = new ArrayList<>();
-            CountDownLatch latch = new CountDownLatch(peerAddrs.size());
+            Semaphore semaphore = new Semaphore(0);
 
             for (String peer : peerAddrs) {
                 Request request = new Request(
@@ -660,11 +659,11 @@ public class RaftNode {
                             votedFor = "";
                             status = FOLLOWER;
                         }
-                        latch.countDown();
+                        semaphore.release();
                         return result.isSuccess();
                     } catch (Exception e) {
                         log.error("heartBeatTask RPC Fail, request URL : {} ", request.getUrl());
-                        latch.countDown();
+                        semaphore.release();
                         return false;
                     }
                 }));
@@ -672,7 +671,7 @@ public class RaftNode {
 
             try {
                 // 等待任务线程执行完毕
-                latch.await(1000, MILLISECONDS);
+                semaphore.tryAcquire((int) Math.floor((peerAddrs.size() + 1) / 2), 6000, MILLISECONDS);
             } catch (InterruptedException e) {
                 log.error(e.getMessage(), e);
             }
@@ -709,7 +708,7 @@ public class RaftNode {
      * 复制日志到跟随者节点
      * preLog 不匹配时自动重试
      */
-    public Future<Boolean> replication(String peer, LogEntry entry, CountDownLatch latch) {
+    public Future<Boolean> replication(String peer, LogEntry entry, Semaphore semaphore) {
 
         return te.submit(() -> {
 
@@ -760,14 +759,14 @@ public class RaftNode {
                     AppendResult result = rpcClient.send(request);
                     if (result == null) {
                         log.error("follower responses with null result, request URL : {} ", peer);
-                        latch.countDown();
+                        semaphore.release();
                         return false;
                     }
                     if (result.isSuccess()) {
                         log.info("append follower entry success, follower=[{}], entry=[{}]", peer, appendParam.getEntries());
                         // 更新索引信息
                         nextIndexes.put(peer, entry.getIndex() + 1);
-                        latch.countDown();
+                        semaphore.release();
                         return true;
                     } else  {
                         // 失败情况1：对方任期比我大，转变成跟随者
@@ -777,7 +776,7 @@ public class RaftNode {
                             term = result.getTerm();
                             status = FOLLOWER;
                             stopHeartBeat();
-                            latch.countDown();
+                            semaphore.release();
                             return false;
                         } else {
                             // 失败情况2：preLog不匹配
@@ -792,7 +791,7 @@ public class RaftNode {
                             } else {
                                 // l == null 说明前一次发送的 preLogIndex 已经来到 -1 的位置，正常情况下应该无条件匹配
                                 log.error("log replication from the beginning fail");
-                                latch.countDown();
+                                semaphore.release();
                                 return false;
                             }
 
@@ -806,7 +805,7 @@ public class RaftNode {
 
                 } catch (Exception e) {
                     log.error("Append entry RPC fail, request URL : {} ", peer);
-                    latch.countDown();
+                    semaphore.release();
                     return false;
                 }
 
@@ -815,7 +814,7 @@ public class RaftNode {
 
             // 超时了
             log.error("replication timeout, peer {}", peer);
-            latch.countDown();
+            semaphore.release();
             return false;
         });
 
