@@ -225,6 +225,7 @@ public class RaftNode {
             }
 
             leader = param.getLeaderId();
+            votedFor = "";
 
             // 收到了新领导者的 append entry 请求，转为跟随者
             if (status != FOLLOWER) {
@@ -532,8 +533,15 @@ public class RaftNode {
                 // 启动心跳任务
                 heartBeatFuture = ss.scheduleWithFixedDelay(heartBeatTask, 0, heartBeatInterval, TimeUnit.MILLISECONDS);
                 // 初始化
-                leaderInit();
-                log.warn("become leader with {} votes", votes);
+                if (leaderInit()){
+                    log.warn("become leader with {} votes", votes);
+                } else {
+                    // 重新选举
+                    votedFor = "";
+                    status = FOLLOWER;
+                    updatePreElectionTime();
+                    log.info("node {} election fail, votes count = {} ", myAddr, votes);
+                }
             } else {
                 // 重新选举
                 votedFor = "";
@@ -551,7 +559,7 @@ public class RaftNode {
      * 2. 发送并提交no-op空日志，以提交旧领导者未提交的日志
      * 3. apply no-op之前的日志
      */
-    private void leaderInit() {
+    private boolean leaderInit() {
         leaderInitializing = true;
         nextIndexes = new ConcurrentHashMap<>();
         for (String peer : peerAddrs) {
@@ -597,6 +605,8 @@ public class RaftNode {
             }
             setCommitIndex(logEntry.getIndex());
             log.info("no-op successfully commit, log index: {}", logEntry.getIndex());
+            leaderInitializing = false;
+            return true;
         } else {
             // 提交失败，删除日志，重新发起选举
             logModule.removeOnStartIndex(logEntry.getIndex());
@@ -605,9 +615,9 @@ public class RaftNode {
             votedFor = "";
             updatePreElectionTime();
             stopHeartBeat();
-
+            leaderInitializing = false;
+            return false;
         }
-        leaderInitializing = false;
 
     }
 
