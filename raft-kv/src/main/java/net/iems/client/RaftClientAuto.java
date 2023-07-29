@@ -11,7 +11,7 @@ import java.util.UUID;
 @Slf4j
 public class RaftClientAuto {
 
-    static final int TEST_NUM = 31;
+    static final int TEST_NUM = 7292;
 
     public static void main(String[] args) throws Throwable {
 

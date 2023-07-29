@@ -17,6 +17,7 @@ import net.iems.service.rpc.RpcServer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Stack;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
@@ -85,7 +86,7 @@ public class RaftNode {
     private final Integer consistencySignal = 1;
 
     /** 等待被一致性信号唤醒的线程 */
-    Thread waitThread;
+    private final Stack<Thread> waitThreads = new Stack<>();
 
     /** 处理选举请求的锁 */
     private final ReentrantLock voteLock = new ReentrantLock();
@@ -123,7 +124,6 @@ public class RaftNode {
         if (last != null){
             term = last.getTerm();
         }
-        waitThread = null;
     }
 
     private void updatePreElectionTime() {
@@ -306,8 +306,36 @@ public class RaftNode {
                 ClientRequest.Type.value(request.getType()), request.getKey(), request.getValue());
 
         if (status == FOLLOWER) {
-            log.warn("redirect to leader: {}", leader);
-            return redirect(request);
+            if (request.getType() == ClientRequest.PUT){
+                log.warn("follower can not write, redirect to leader: {}", leader);
+                return redirect(request);
+            } else if (request.getType() == ClientRequest.GET) {
+                SyncParam syncParam = SyncParam.builder()
+                                                .followerId(myAddr)
+                                                .followerIndex(getCommitIndex())
+                                                .build();
+                Request syncRequest = Request.builder()
+                                                .cmd(Request.FOLLOWER_SYNC)
+                                                .obj(syncParam)
+                                                .url(leader)
+                                                .build();
+                try {
+                    SyncResponse syncResponse = rpcClient.send(syncRequest, 7000);
+                    if (syncResponse.isSuccess()){
+                        log.warn("follower read success");
+                        String value = stateMachine.getString(request.getKey());
+                        if (value != null) {
+                            return ClientResponse.ok(value);
+                        }
+                        return ClientResponse.ok(null);
+                    }
+                } catch (RemotingException | InterruptedException e){
+                    log.warn("sync with leader fail, follower: {}", myAddr);
+                }
+                log.warn("follower read fail, redirect to leader: {}", leader);
+                return redirect(request);
+            }
+
         } else if (status == CANDIDATE){
             log.warn("candidate declines client request: {} ", request);
             return ClientResponse.fail();
@@ -323,14 +351,13 @@ public class RaftNode {
             synchronized (consistencySignal){
                 try {
                     // 等待一个心跳周期，以保证当前领导者有效
-                    waitThread = Thread.currentThread();
+                    log.warn("leader check");
+                    waitThreads.push(Thread.currentThread());
                     consistencySignal.wait();
                 } catch (InterruptedException e) {
                     log.error("thread has been interrupted.");
-                    waitThread = null;
                     return ClientResponse.fail();
                 }
-                waitThread = null;
                 String value = stateMachine.getString(request.getKey());
                 if (value != null) {
                     return ClientResponse.ok(value);
@@ -347,14 +374,14 @@ public class RaftNode {
 
         // 写操作
         LogEntry logEntry = LogEntry.builder()
-                .command(Command.builder()
-                        .key(request.getKey())
-                        .value(request.getValue())
-                        .type(CommandType.PUT)
-                        .build())
-                .term(term)
-                .requestId(request.getRequestId())
-                .build();
+                                    .command(Command.builder()
+                                            .key(request.getKey())
+                                            .value(request.getValue())
+                                            .type(CommandType.PUT)
+                                            .build())
+                                    .term(term)
+                                    .requestId(request.getRequestId())
+                                    .build();
 
         // 写入本地日志并更新logEntry的index
         logModule.write(logEntry);
@@ -393,6 +420,49 @@ public class RaftNode {
             log.warn("commit fail, logEntry info : {}", logEntry);
             // 响应客户端
             return ClientResponse.fail();
+        }
+    }
+
+    /**
+     * 处理 follower 日志同步请求
+     * @param param
+     * @return
+     */
+    public SyncResponse handleSyncRequest(SyncParam param){
+        if (status != LEADER){
+            return SyncResponse.fail();
+        }
+        synchronized (consistencySignal){
+            try {
+                // 等待一个心跳周期，以保证当前领导者有效
+                log.warn("leader check");
+                waitThreads.push(Thread.currentThread());
+                consistencySignal.wait();
+            } catch (InterruptedException e) {
+                log.error("thread has been interrupted.");
+                return SyncResponse.fail();
+            }
+        }
+        if (param.getFollowerIndex() == getCommitIndex()){
+            return SyncResponse.ok();
+        }
+        //  复制日志到follower
+        List<Future<Boolean>> futureList = new ArrayList<>();
+        Semaphore semaphore = new Semaphore(0);
+        futureList.add(replication(param.getFollowerId(),
+                                    LogModule.getInstance().read(getCommitIndex()),
+                                    semaphore));
+        try {
+            // 等待 replication 中的线程执行完毕
+            semaphore.tryAcquire(1, 6000, MILLISECONDS);
+        } catch (InterruptedException e) {
+            log.error(e.getMessage(), e);
+            return SyncResponse.fail();
+        }
+        if (getReplicationResult(futureList) == 1){
+            return SyncResponse.ok();
+        } else {
+            return SyncResponse.fail();
         }
     }
 
@@ -456,18 +526,18 @@ public class RaftNode {
                     }
 
                     // 封装请求体
-                    VoteParam voteParam = VoteParam.builder().
-                            term(term).
-                            candidateAddr(myAddr).
-                            lastLogIndex(lastLogIndex).
-                            lastLogTerm(lastLogTerm).
-                            build();
+                    VoteParam voteParam = VoteParam.builder()
+                                                    .term(term)
+                                                    .candidateAddr(myAddr)
+                                                    .lastLogIndex(lastLogIndex)
+                                                    .lastLogTerm(lastLogTerm)
+                                                    .build();
 
                     Request request = Request.builder()
-                            .cmd(Request.R_VOTE)
-                            .obj(voteParam)
-                            .url(peer)
-                            .build();
+                                            .cmd(Request.R_VOTE)
+                                            .obj(voteParam)
+                                            .url(peer)
+                                            .build();
 
                     try {
                         // rpc 调用
@@ -534,7 +604,7 @@ public class RaftNode {
                 heartBeatFuture = ss.scheduleWithFixedDelay(heartBeatTask, 0, heartBeatInterval, TimeUnit.MILLISECONDS);
                 // 初始化
                 if (leaderInit()){
-                    log.warn("become leader with {} votes", votes);
+                    log.warn("become leader with {} votes", votes + 1);
                 } else {
                     // 重新选举
                     votedFor = "";
@@ -653,10 +723,9 @@ public class RaftNode {
             Semaphore semaphore = new Semaphore(0);
 
             for (String peer : peerAddrs) {
-                Request request = new Request(
-                        Request.A_ENTRIES,
-                        param,
-                        peer);
+                Request request = new Request(Request.A_ENTRIES,
+                                                param,
+                                                peer);
 
                 // 并行发起 RPC 复制并获取响应
                 futureList.add(te.submit(() -> {
@@ -681,25 +750,33 @@ public class RaftNode {
 
             try {
                 // 等待任务线程执行完毕
-                semaphore.tryAcquire((int) Math.floor((peerAddrs.size() + 1) / 2), 6000, MILLISECONDS);
+                semaphore.tryAcquire((int) Math.floor((peerAddrs.size() + 1) / 2), 2000, MILLISECONDS);
             } catch (InterruptedException e) {
                 log.error(e.getMessage(), e);
             }
 
-            int success = getReplicationResult(futureList);
-
             //  心跳响应成功，通知阻塞的线程
-            if (waitThread != null){
+            if (waitThreads.size() > 0){
+                int success = getReplicationResult(futureList);
                 if (success * 2 >= peerAddrs.size()) {
                     synchronized (consistencySignal){
-                        consistencySignal.notify();
+                        consistencySignal.notifyAll();
                     }
                 } else {
-                    waitThread.interrupt();
+                    Thread waitThread;
+                    while ((waitThread = getWaitThread()) != null){
+                        waitThread.interrupt();
+                    }
                 }
             }
-
         }
+    }
+
+    private synchronized Thread getWaitThread(){
+        if (waitThreads.size() > 0){
+            return waitThreads.pop();
+        }
+        return null;
     }
 
 

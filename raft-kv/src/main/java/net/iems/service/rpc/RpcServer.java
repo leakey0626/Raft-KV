@@ -53,6 +53,8 @@ public class RpcServer {
             return new Response<>(node.appendEntries((AppendParam) request.getObj()));
         } else if (request.getCmd() == Request.CLIENT_REQ) {
             return new Response<>(node.propose((ClientRequest) request.getObj()));
+        } else if (request.getCmd() == Request.FOLLOWER_SYNC){
+            return new Response<>(node.handleSyncRequest((SyncParam) request.getObj()));
         }
         return null;
     }

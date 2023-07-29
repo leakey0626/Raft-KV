@@ -53,7 +53,7 @@ public class RaftClientRPC {
 
             // 不断重试，直到响应成功
             try {
-                response = CLIENT.send(r, 500);
+                response = CLIENT.send(r, 8000);
             } catch (Exception e) {
                 // 请求超时，连接下一个节点
                 index = (index + 1) % size;
@@ -88,7 +88,7 @@ public class RaftClientRPC {
 
             // 不断重试，直到响应成功
             try {
-                response = CLIENT.send(r, 500);
+                response = CLIENT.send(r, 8000);
             } catch (Exception e) {
                 // 请求超时，连接下一个节点
                 index = (index + 1) % size;
